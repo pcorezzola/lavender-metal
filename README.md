@@ -81,7 +81,7 @@ verified (on the device unless noted).
 - ~~M5.3: libraries and the shader compiler (AIR -> NIR -> ir3 for A5xx), function constants by index and by name, compute encoder~~
 - ~~M5.4: render pipeline and render encoder~~
 - ~~M5.5: CAMetalLayer drawable over an IOSurface, presented~~
-- ~~M5.6: CoreAnimation over Metal: the lock screen (wallpaper, date, clock, camera button, bottom bar) is drawn by `backboardd` through the plug-in; Control Centre and the home screen with the plug-in on still show glitches, see *Open problems*~~
+- ~~M5.6: CoreAnimation over Metal: the lock screen (wallpaper, date, clock, camera button, bottom bar) is drawn by `backboardd` through the plug-in; Control Centre looks right with the plug-in on (flat grey and black bands with it off), the home screen still to be checked~~
 - [ ] Idle lock screen costs a fraction of the software renderer's `backboardd` CPU (software: ~150-170 % of 400 %, ~13 fps); animations are still slow, see *Findings*
 - [ ] Astronomy wallpaper (`AegirPoster`, Metal): not working, the extension aborts on launch (see *Open problems*)
 
@@ -111,10 +111,11 @@ Measured on the phone; the numbers are what to expect, not what to hope for.
 
 ## Open problems
 
-- **Wallpaper previews, widgets and blurs.** In the poster gallery the previews are blank white (text and complications
-  draw), the category icons are empty circles, the Calendar widget is a white square, and Control Centre shows a flat grey
-  backdrop with a black band at the top and black dashes near the bottom. It looked the same with the plug-in off, so
-  it is probably the materials/blur path, not the compositor; not yet isolated.
+- **Wallpaper previews and widgets.** In the poster gallery the previews are blank white (text and complications draw),
+  the category icons are empty circles and the Calendar widget is a white square. Control Centre had a flat grey backdrop, a
+  black band at the top and black dashes at the bottom while the plug-in was *off* (software renderer); with the plug-in
+  *on* (2026-11-26) the colour is even and the transparencies work. Whether the previews and the widget also improve with
+  the GPU renderer is still to be checked; the widget's SwiftUI view was seen burning ~60 % CPU for minutes on the slow cores.
 - **Astronomy (`AegirPoster`)** aborts a fraction of a second after launch inside `NUNIAegirRenderer
   getOrCreateUniformBufferforFrameBufferIndex:` (a Metal buffer comes back nil). It respawns every ~10 s. It is a second GPU
   client next to `backboardd`, which hung the GPU before: **only one process may use the plug-in at a time.**
