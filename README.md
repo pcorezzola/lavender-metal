@@ -72,17 +72,61 @@ verified (on the device unless noted).
 - 2D solid fill: parked, no variant wrote anything
 - [ ] Depth (optional; only if CoreAnimation needs it)
 
-**M5 - The Metal device** (in progress)
+**M5 - The Metal device** (in progress; `backboardd` renders on the GPU since 2026-11-24)
 
 - ~~M5.0: the GPU as an IOKit service, `LavenderGPU`, with a user client (info, buffer new/free mapped into the client, submit of PM4 words, submit by reference). Verified on the device from the kernel (selftest) and from a userland program: the GPU writes into a mapped buffer and the program reads it back (patch 0319 in the port)~~
 - ~~M5.1: a device that exists: the `LavenderMetal` bundle, and `MTLCreateSystemDefaultDevice()` returns it on the phone (the plug-in properties are put on `IOAcceleratorES` on demand by the service)~~
 - ~~M5.2: buffers, command queue, command buffer and blit encoder (fill by the command processor, copy by the 2D core) through Metal's own objects, verified byte by byte on the phone~~
-- [ ] M5.2b: textures and samplers (next to compute)
-- [ ] M5.3: libraries and the shader compiler (AIR to A5xx), compute encoder
-- [ ] M5.4: render pipeline and render encoder: a triangle through Metal
-- [x] M5.5: CAMetalLayer drawable over an IOSurface, presented (checked in a process; the compositor is M5.6)
-- [ ] M5.6: CoreAnimation over Metal (PosterBoard preview, Astronomy wallpaper)
-- [ ] Idle lock screen costs a fraction of today's `backboardd` CPU (now ~150-170 % of 400 %, ~13 fps)
+- ~~M5.2b: textures (1D/2D, A8/R8/R16/RG8/R32/RG16F/RGBA16F/RGB10A2/sRGB, mip level 0) and samplers; the 16 texture/sampler units are always emitted (1x1 descriptors in the empty ones), otherwise QuartzCore's uber fragment shader hangs the CP~~
+- ~~M5.3: libraries and the shader compiler (AIR -> NIR -> ir3 for A5xx), function constants by index and by name, compute encoder~~
+- ~~M5.4: render pipeline and render encoder~~
+- ~~M5.5: CAMetalLayer drawable over an IOSurface, presented~~
+- ~~M5.6: CoreAnimation over Metal: the lock screen (wallpaper, date, clock, camera button, bottom bar) is drawn by `backboardd` through the plug-in; Control Centre and the home screen with the plug-in on still show glitches, see *Open problems*~~
+- [ ] Idle lock screen costs a fraction of the software renderer's `backboardd` CPU (software: ~150-170 % of 400 %, ~13 fps); animations are still slow, see *Findings*
+- [ ] Astronomy wallpaper (`AegirPoster`, Metal): not working, the extension aborts on launch (see *Open problems*)
+
+## Findings (2026-11-25)
+
+Measured on the phone; the numbers are what to expect, not what to hope for.
+
+- **The GPU cannot touch memory at or above 4 GB.** Any write (`CP_BLIT`, `CP_MEM_WRITE`) to a physical address >= 4 GB hangs
+  the GPU with *no* SMMU fault (GFSR/FSR/FAR/FSYNR0 all zero) and every later submit fails until the phone is rebooted.
+  Extending the CB4 identity table to 8 GB or setting `TCR.IPS` made no difference. About 65 % of the pages of the 1080x2340
+  scanout IOSurface (622 scattered 16 KB runs) are above 4 GB, so GPU-to-IOSurface copies are not possible and the GPU
+  can only work on its own buffers below 4 GB. Open hypothesis: only 2 of the 12 `*_ADDR_MODE_CNTL` registers are written
+  in the service path (the rest only in the compute self-test); `lavaddr64=1` (patch 0366) writes them all, untested.
+- **Cost of a frame is the copy, not the GPU.** Textures are mapped write-combined and the CPU reads them very slowly;
+  the IOSurface copy took 25-90 ms per commit. Cacheable (write-back) textures with an explicit data-cache flush of whatever
+  the CPU touched (`lavexp=32`, patch 0365) bring it to ~3-15 ms (mean 6 ms); typical commits 7-20 ms.
+- **Fixed cost per GPU submit** was ~11 ms (10 ms sleeps in the service's ring wait); polling every 50 us first brought
+  commits of ~80 submits from ~1 s to 77-163 ms (patch 0359).
+- **Fill rate** ~0.45-0.7 Gpix/s (160 MHz: ~0.45; 266 MHz: ~0.66). `lavgpuclk=266` boots and is stable. Neither the RB/CCU
+  bits nor `VBIF` QoS (patch 0360) changed it; fewer pixels per frame (damage, GMEM, batching) is what is left.
+- **Compile cost.** "Control bytes" analysis of the uber shader (~566 ms each, 2084 per boot) is now done once per
+  pipeline and cached in memory and on disk (`/var/tmp/lavmetal-cache/*.ctl`, `*.spec`): a warm boot does 0 analyses and 0
+  shader compiles, the first commit takes ~2 s instead of 12-47 s.
+- **Debug switches** (all cost nothing when the marker file is absent): `/var/tmp/lavexp` (bit 0 DP2, 1 CCU, 2 GPU copy -
+  do not use, 3 blit self-test, 4 surface self-test, 5 cacheable textures), `/var/tmp/lavtrace`, `/var/tmp/lavlist`,
+  `/var/tmp/lavshot` (dumps the surface to `/var/tmp/lavsurf.bgra`; needs `lavtrace`), `/var/tmp/lavprof`.
+
+## Open problems
+
+- **Wallpaper previews, widgets and blurs.** In the poster gallery the previews are blank white (text and complications
+  draw), the category icons are empty circles, the Calendar widget is a white square, and Control Centre shows a flat grey
+  backdrop with a black band at the top and black dashes near the bottom. It looked the same with the plug-in off, so
+  it is probably the materials/blur path, not the compositor; not yet isolated.
+- **Astronomy (`AegirPoster`)** aborts a fraction of a second after launch inside `NUNIAegirRenderer
+  getOrCreateUniformBufferforFrameBufferIndex:` (a Metal buffer comes back nil). It respawns every ~10 s. It is a second GPU
+  client next to `backboardd`, which hung the GPU before: **only one process may use the plug-in at a time.**
+- **After a reboot the plug-in is off:** run `lavmetal_switch on`, then restart `backboardd` and SpringBoard. (A boot-arg
+  `lavmetal=1` that does it at start is the first thing worth taking from the `aLpHa-Git-69` fork.)
+- Hardware limits: HS400 eMMC does not boot; CPU Gold is capped at 1113.6 MHz (voltage is not programmable).
+
+## Ideas worth taking from forks
+
+`aLpHa-Git-69/lavender-metal` (9 commits on top of `main`): the `lavmetal=1` boot-arg, deferred compile of the uber
+fragment shader, specialisation over several UBOs/SSBOs, no ir3 listing by default, and logging submits only when
+they fail. The pool, GPU clock and fast-poll parts duplicate what is already here.
 
 ## Related repositories
 
