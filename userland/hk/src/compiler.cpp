@@ -357,6 +357,96 @@ bool doneTranslating(uint64_t key, Translation* t) {
     return true;
 }
 
+// The module's local arrays are scratch (store_scratch / load_scratch at byte offsets): CoreAnimation's uber shader copies its
+// configuration buffer into one at the top and steers by reading it back, which hides the folded values from the branches that
+// depend on them. A load whose bytes were all stored once, as constants, by the entry block (nothing stores to them elsewhere, no
+// store has an offset that is not a constant) is those constants: forwarded, the branches they decide fold away.
+bool forwardScratch(nir_shader* nir) {
+    nir_function_impl* impl = nir_shader_get_entrypoint(nir);
+    if (impl == nullptr || nir->scratch_size == 0) return false;
+    const unsigned size = nir->scratch_size;
+    std::vector<uint8_t> value(size, 0);
+    std::vector<uint8_t> state(size, 0);   // 0 never stored, 1 stored once by the entry block as a constant, 2 anything else
+    std::vector<uint32_t> order(size, 0);  // (the entry block's instruction number of that store)
+    nir_block* start = nir_start_block(impl);
+    uint32_t seq = 0;
+    nir_foreach_block(block, impl) {
+        nir_foreach_instr(instr, block) {
+            if (block == start) seq++;
+            if (instr->type != nir_instr_type_intrinsic) continue;
+            nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic != nir_intrinsic_store_scratch) continue;
+            if (!nir_src_is_const(in->src[1])) return false;   // an offset that is not known: any byte may be hit
+            const unsigned bytes = in->src[0].ssa->bit_size / 8, comps = in->src[0].ssa->num_components;
+            const uint64_t at = nir_src_as_uint(in->src[1]);
+            if (in->src[0].ssa->bit_size % 8 != 0) return false;
+            const unsigned mask = nir_intrinsic_write_mask(in);
+            for (unsigned c = 0; c < comps; c++) {
+                if (!(mask & (1u << c))) continue;
+                nir_scalar sc = nir_scalar_resolved(in->src[0].ssa, c);
+                const bool isConst = nir_scalar_is_const(sc);
+                const uint64_t v = isConst ? nir_scalar_as_uint(sc) : 0;
+                for (unsigned i = 0; i < bytes; i++) {
+                    const uint64_t b = at + uint64_t(c) * bytes + i;
+                    if (b >= size) return false;
+                    if (state[b] == 0 && block == start && isConst) {
+                        state[b] = 1;
+                        value[b] = uint8_t(v >> (8 * i));
+                        order[b] = seq;
+                    } else {
+                        state[b] = 2;
+                    }
+                }
+            }
+        }
+    }
+    bool progress = false;
+    nir_builder b = nir_builder_create(impl);
+    seq = 0;
+    nir_foreach_block(block, impl) {
+        nir_foreach_instr_safe(instr, block) {
+            if (block == start) seq++;
+            if (instr->type != nir_instr_type_intrinsic) continue;
+            nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic != nir_intrinsic_load_scratch || !nir_src_is_const(in->src[0])) continue;
+            const unsigned bits = in->def.bit_size, comps = in->def.num_components;
+            if (bits % 8 != 0 || bits > 64) continue;
+            const uint64_t at = nir_src_as_uint(in->src[0]);
+            const uint64_t n = uint64_t(comps) * (bits / 8);
+            if (at + n > size) continue;
+            bool ok = true;
+            for (uint64_t i = at; i < at + n && ok; i++) {
+                if (state[i] != 1) ok = false;
+                else if (block == start && order[i] > seq) ok = false;   // (read in the entry block before the store)
+            }
+            if (!ok) continue;
+            nir_const_value values[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned c = 0; c < comps; c++) {
+                uint64_t v = 0;
+                for (unsigned i = 0; i < bits / 8; i++) v |= uint64_t(value[at + uint64_t(c) * (bits / 8) + i]) << (8 * i);
+                values[c] = nir_const_value_for_raw_uint(v, bits);
+            }
+            b.cursor = nir_before_instr(&in->instr);
+            nir_def_replace(&in->def, nir_build_imm(&b, comps, bits, values));
+            progress = true;
+        }
+    }
+    if (getenv("HAKIOS_METAL_PHASES") != nullptr) {
+        unsigned st[3] = {0, 0, 0}, loads = 0, dyn = 0;
+        for (unsigned i = 0; i < size; i++) st[state[i]]++;
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic == nir_intrinsic_load_scratch) { loads++; if (!nir_src_is_const(in->src[0])) dyn++; }
+            }
+        }
+        std::fprintf(stderr, "forwardScratch: size %u, bytes never %u / once-const %u / other %u; loads left %u (%u dynamic); %s\n", size, st[0], st[1], st[2],
+                     loads, dyn, progress ? "forwarded some" : "nothing");
+    }
+    return progress;
+}
+
 // store_scratch with no load_scratch anywhere: written and never read, taken away with the scratch size
 bool dropUnreadScratch(nir_shader* nir) {
     bool reads = false;
@@ -457,16 +547,21 @@ bool translate(const void* bitcode, size_t size, Translation& t, std::string* wh
         nir_copy_prop(t.nir);
         progress = nir_opt_constant_folding(t.nir);
         progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, const_cast<KnownBuffer*>(known)) || progress;
+        progress = forwardScratch(t.nir) || progress;
     }
     // ...and the branches the folded values decide taken away at once, with what only they used: ir3's own passes
     // would do the same, but only after running over the whole uber shader first (ir3_finalize_nir, 494 of a
     // specialisation's 700 ms on this machine)
-    if (known != nullptr && getenv("HAKIOS_METAL_NO_EARLY_DCE") == nullptr) {
+    // (the same for any vertex or fragment stage, known buffer or not: a local table of constants that the shader steers by, as
+    // CoreAnimation's uber shader has, is read back as those constants, and what it decides folds away)
+    const bool graphics = t.nir->info.stage == MESA_SHADER_FRAGMENT || t.nir->info.stage == MESA_SHADER_VERTEX;
+    if ((known != nullptr || graphics) && getenv("HAKIOS_METAL_NO_EARLY_DCE") == nullptr) {
         for (bool progress = true; progress;) {
             progress = nir_opt_dead_cf(t.nir);
             progress = nir_opt_dce(t.nir) || progress;
             progress = nir_copy_prop(t.nir) || progress;
             progress = nir_opt_constant_folding(t.nir) || progress;
+            progress = forwardScratch(t.nir) || progress;
         }
         // (the local arrays of the branches gone: the front end makes an alloca load_scratch and store_scratch, and a
         // store has an effect DCE keeps. With no load left the stores are dead, and so is the private memory the
@@ -1015,7 +1110,7 @@ bool fillKernel(Translation& t, const KernelHome& out, uint32_t highestSampler, 
     out.immediates.assign(cs->immediates, cs->immediates + cs->immediates_count);
     // (HAKIOS_METAL_LISTING=0: none -- the disassembly is a fifth of a CoreAnimation stage's compile, and the window
     // server reads no listing)
-    static const bool listings = [] { const char* e = getenv("HAKIOS_METAL_LISTING"); return e == nullptr || e[0] != '0'; }();
+    static const bool listings = [] { return access("/var/tmp/lavlist", F_OK) == 0; }();
     if (listings) {
         char* text = nullptr;
         size_t length = 0;

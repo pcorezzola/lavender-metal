@@ -36,6 +36,10 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <dlfcn.h>
 #include <sys/stat.h>
 
 #define LAV_LOG "/var/root/lavmetal.log"
@@ -62,7 +66,7 @@ lavlog(const char * fmt, ...)
 /* The service: LavenderGPU (kernel/LavenderGPU.cpp). Buffers, and streams of PM4 words submitted by reference.         */
 /* ------------------------------------------------------------------------------------------------------------------ */
 
-enum { kLavInfo = 0, kLavBufNew = 1, kLavBufFree = 2, kLavSubmit = 3, kLavSubmitBuf = 4, kLavMetal = 5 };
+enum { kLavInfo = 0, kLavBufNew = 1, kLavBufFree = 2, kLavSubmit = 3, kLavSubmitBuf = 4, kLavMetal = 5, kLavSegs = 6 };
 
 struct lav_buf_new { uint64_t size; uint32_t handle, pad; uint64_t address; };
 struct lav_buf_free { uint32_t handle, pad; };
@@ -77,6 +81,7 @@ struct lbuf {
 	void * cpu;                     /* the process's mapping */
 	size_t len;
 	mach_vm_address_t map;
+	int cached;                     /* write-back memory of its own (lav_buf_new.pad bit 0): the CPU's accesses are followed by a flush of what they touched */
 };
 
 static io_connect_t gConn;
@@ -84,10 +89,11 @@ static struct lbuf gStream;         /* [0, 16 KB): the PM4 words of a submission
 static pthread_mutex_t gGPULock = PTHREAD_MUTEX_INITIALIZER;
 
 #define STREAM_WORDS    4096u
+#define LAV_BAND_ROWS   400u        /* rows of a draw per submit */
 #define SCRATCH_OFFSET  0x8000u
 
 static BOOL
-lavBufNewDirect(size_t len, struct lbuf * b)
+lavBufNewDirectF(size_t len, struct lbuf * b, uint32_t flags)
 {
 	struct lav_buf_new bn;
 	size_t out = sizeof(bn);
@@ -96,6 +102,7 @@ lavBufNewDirect(size_t len, struct lbuf * b)
 
 	memset(&bn, 0, sizeof(bn));
 	bn.size = len;
+	bn.pad = flags;
 	kr = IOConnectCallStructMethod(gConn, kLavBufNew, &bn, sizeof(bn), &bn, &out);
 	if (kr != KERN_SUCCESS) {
 		lavlog("buffer of %zu bytes: kr %#x", len, kr);
@@ -115,7 +122,14 @@ lavBufNewDirect(size_t len, struct lbuf * b)
 		return NO;
 	}
 	b->cpu = (void *)(uintptr_t)b->map;
+	b->cached = (flags & 1) != 0;
 	return YES;
+}
+
+static BOOL
+lavBufNewDirect(size_t len, struct lbuf * b)
+{
+	return lavBufNewDirectF(len, b, 0);
 }
 
 static void
@@ -292,7 +306,15 @@ lavSubmit(const uint32_t * words, size_t count)
 		return NO;
 	}
 	memcpy(gStream.cpu, words, count * 4);
+	uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 	kr = IOConnectCallStructMethod(gConn, kLavSubmitBuf, &sb, sizeof(sb), &out, &outsize);
+	{
+		uint64_t ms = (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1000000u;
+
+		if (ms >= 100) {
+			lavlog("submit of %zu words took %llu ms", count, (unsigned long long)ms);
+		}
+	}
 	if (kr != KERN_SUCCESS || out.fence == 0) {
 		lavlog("submit of %zu words: kr %#x fence %u status %u", count, kr, out.fence, out.status);
 		return NO;
@@ -712,7 +734,7 @@ bufferSetLabel(id self, __unused SEL _cmd, id label)
 
 /* ---- queue, command buffer, blit encoder ---- */
 
-enum opkind { OP_FILL, OP_COPY, OP_DISPATCH, OP_CLEAR, OP_DRAW };
+enum opkind { OP_FILL, OP_COPY, OP_DISPATCH, OP_CLEAR, OP_DRAW, OP_TEXCOPY };
 
 /* a compute dispatch as the encoder had it when it was encoded: the pipeline, what is bound, the grid */
 struct dispatch {
@@ -756,6 +778,7 @@ struct op {
 	uint64_t srcOff, dstOff, size;
 	uint8_t value;
 	struct dispatch * disp;
+	uint64_t cx, cy, cw, ch, cdx, cdy;      /* OP_TEXCOPY: source origin and size, destination origin (level 0) */
 };
 
 struct cbstate {
@@ -1123,6 +1146,8 @@ struct fnstate {
 	NSString * name;
 	int type;                               /* the metallib's: 0 vertex, 1 fragment, 2 kernel */
 	id label;
+	struct lavcc_const * consts;            /* the function constants the pipeline specialised it with (malloc'd), or NULL */
+	unsigned nconsts;
 };
 
 struct pipestate {
@@ -1318,11 +1343,236 @@ libNewFunction(id self, __unused SEL _cmd, id name)
 	return nil;
 }
 
+/* Function constants. MTLFunctionConstantValues has no getter, so the setters are wrapped: each value set is kept on the object
+ * (an associated NSMutableData of struct lavcc_const) and copied into the function made from it, to specialise the compile. */
+static char gFCKey;
+static IMP gFCSetAt, gFCSetRange, gFCSetName, gFCReset, gFCCopy;
+
+static BOOL
+fcBits(const void * v, uint64_t type, uint64_t * bits, unsigned * esize)
+{
+	unsigned n = 0, w = 0;
+	uint64_t b = 0;
+
+	if (type >= 3 && type <= 6) { n = (unsigned)type - 2; w = 32; }
+	else if (type >= 16 && type <= 19) { n = (unsigned)type - 15; w = 16; }
+	else if (type >= 29 && type <= 32) { n = (unsigned)type - 28; w = 32; }
+	else if (type >= 33 && type <= 36) { n = (unsigned)type - 32; w = 32; }
+	else if (type >= 37 && type <= 40) { n = (unsigned)type - 36; w = 16; }
+	else if (type >= 41 && type <= 44) { n = (unsigned)type - 40; w = 16; }
+	else if (type >= 45 && type <= 48) { n = (unsigned)type - 44; w = 8; }
+	else if (type >= 49 && type <= 52) { n = (unsigned)type - 48; w = 8; }
+	else if (type >= 53 && type <= 56) { n = (unsigned)type - 52; w = 8; }
+	else {
+		return NO;
+	}
+	*esize = n * w / 8;
+	if (type >= 53) {
+		for (unsigned i = 0; i < n; i++) {
+			b |= (uint64_t)(((const uint8_t *)v)[i] != 0) << i;
+		}
+	} else if (n * w <= 64) {
+		memcpy(&b, v, n * w / 8);
+	} else {
+		return NO;
+	}
+	*bits = b;
+	return YES;
+}
+
+/* one value set on a MTLFunctionConstantValues: by index, or (NAME not empty) by name, which a function resolves to its own index */
+struct fcrec {
+	uint32_t index;
+	uint64_t bits;
+	char name[56];
+};
+
+static void
+fcRecord(id obj, uint32_t index, uint64_t bits, const char * name)
+{
+	@synchronized (obj) {
+		NSMutableData * d = objc_getAssociatedObject(obj, &gFCKey);
+		struct fcrec e;
+
+		memset(&e, 0, sizeof(e));
+		e.index = index;
+		e.bits = bits;
+		if (name != NULL) {
+			snprintf(e.name, sizeof(e.name), "%s", name);
+		}
+		if (d == nil) {
+			d = [NSMutableData data];
+			objc_setAssociatedObject(obj, &gFCKey, d, OBJC_ASSOCIATION_RETAIN);
+		}
+		struct fcrec * c = [d mutableBytes];
+		for (NSUInteger i = 0; i < [d length] / sizeof(*c); i++) {
+			if (name != NULL ? strcmp(c[i].name, e.name) == 0 : (c[i].name[0] == 0 && c[i].index == index)) {
+				c[i].bits = bits;
+				return;
+			}
+		}
+		[d appendBytes:&e length:sizeof(e)];
+	}
+}
+
+static void
+fcSetAt(id self, SEL cmd, const void * value, uint64_t type, uint64_t index)
+{
+	uint64_t bits;
+	unsigned es;
+
+	if (value != NULL && fcBits(value, type, &bits, &es)) {
+		fcRecord(self, (uint32_t)index, bits, NULL);
+	} else {
+		lavlog("function constant %llu: type %llu not served", (unsigned long long)index, (unsigned long long)type);
+	}
+	((void (*)(id, SEL, const void *, uint64_t, uint64_t))gFCSetAt)(self, cmd, value, type, index);
+}
+
+static void
+fcSetRange(id self, SEL cmd, const void * values, uint64_t type, NSRange range)
+{
+	uint64_t bits;
+	unsigned es;
+	const void * p = values;
+
+	for (NSUInteger i = 0; p != NULL && i < range.length; i++) {
+		if (!fcBits(p, type, &bits, &es)) {
+			break;
+		}
+		fcRecord(self, (uint32_t)(range.location + i), bits, NULL);
+		p = (const uint8_t *)p + es;
+	}
+	((void (*)(id, SEL, const void *, uint64_t, NSRange))gFCSetRange)(self, cmd, values, type, range);
+}
+
+static void
+fcSetName(id self, SEL cmd, const void * value, uint64_t type, id name)
+{
+	uint64_t bits;
+	unsigned es;
+
+	if (value != NULL && name != nil && fcBits(value, type, &bits, &es)) {
+		fcRecord(self, 0xffffffffu, bits, [name UTF8String]);
+	} else {
+		lavlog("function constant by name %s (type %llu): not served", name != nil ? [name UTF8String] : "(nil)", (unsigned long long)type);
+	}
+	((void (*)(id, SEL, const void *, uint64_t, id))gFCSetName)(self, cmd, value, type, name);
+}
+
+static void
+fcReset(id self, SEL cmd)
+{
+	objc_setAssociatedObject(self, &gFCKey, nil, OBJC_ASSOCIATION_RETAIN);
+	((void (*)(id, SEL))gFCReset)(self, cmd);
+}
+
 static id
-libNewFunctionConstants(id self, SEL cmd, id name, __unused id constants, NSError ** err)
+fcCopy(id self, SEL cmd, void * zone)
+{
+	id c = ((id (*)(id, SEL, void *))gFCCopy)(self, cmd, zone);
+	NSData * d = objc_getAssociatedObject(self, &gFCKey);
+
+	if (c != nil && d != nil) {
+		objc_setAssociatedObject(c, &gFCKey, [[d mutableCopy] autorelease], OBJC_ASSOCIATION_RETAIN);
+	}
+	return c;
+}
+
+static void
+fcHook(Class cls, SEL sel, IMP imp, IMP * orig)
+{
+	Method m = class_getInstanceMethod(cls, sel);
+
+	if (m == NULL) {
+		lavlog("function constants: %s is not on %s", sel_getName(sel), class_getName(cls));
+		return;
+	}
+	*orig = method_setImplementation(m, imp);
+}
+
+static void
+installConstantHooks(void)
+{
+	Class cls = NSClassFromString(@"MTLFunctionConstantValuesInternal");
+
+	if (cls == Nil) {
+		cls = NSClassFromString(@"MTLFunctionConstantValues");
+	}
+	if (cls == Nil) {
+		lavlog("function constants: no MTLFunctionConstantValues class");
+		return;
+	}
+	fcHook(cls, sel_registerName("setConstantValue:type:atIndex:"), (IMP)fcSetAt, &gFCSetAt);
+	fcHook(cls, sel_registerName("setConstantValues:type:withRange:"), (IMP)fcSetRange, &gFCSetRange);
+	fcHook(cls, sel_registerName("setConstantValue:type:withName:"), (IMP)fcSetName, &gFCSetName);
+	fcHook(cls, sel_registerName("reset"), (IMP)fcReset, &gFCReset);
+	fcHook(cls, sel_registerName("copyWithZone:"), (IMP)fcCopy, &gFCCopy);
+	lavlog("function constants: setters of %s wrapped", class_getName(cls));
+}
+
+/* give function F the constants recorded on the values object CONSTANTS (names resolved to F's own indices) */
+static void
+fnTakeConstants(id f, id constants)
+{
+	struct fnstate * st;
+	NSData * d;
+	struct lavcc_fcname decl[128];
+	unsigned ndecl, nrec;
+	const struct fcrec * rec;
+
+	if (f == nil || constants == nil) {
+		return;
+	}
+	st = STATE(f, struct fnstate);
+	@synchronized (constants) {
+		d = [[objc_getAssociatedObject(constants, &gFCKey) copy] autorelease];
+	}
+	free(st->consts);
+	st->consts = NULL;
+	st->nconsts = 0;
+	if (d == nil || [d length] == 0) {
+		lavlog("function %s: no function constants recorded", [st->name UTF8String]);
+		return;
+	}
+	nrec = (unsigned)([d length] / sizeof(struct fcrec));
+	rec = [d bytes];
+	ndecl = lavcc_function_constants(STATE(st->library, struct libstate)->lib, [st->name UTF8String], decl, 128);
+	st->consts = calloc(nrec, sizeof(struct lavcc_const));
+	for (unsigned i = 0; i < nrec; i++) {
+		int64_t idx = rec[i].index;
+
+		if (rec[i].name[0] != 0) {
+			idx = -1;
+			for (unsigned k = 0; k < ndecl; k++) {
+				if (strcmp(decl[k].name, rec[i].name) == 0) {
+					idx = decl[k].index;
+					break;
+				}
+			}
+		}
+		if (idx < 0) {
+			continue;       /* a constant of another function of the same set */
+		}
+		st->consts[st->nconsts++] = (struct lavcc_const){ (uint32_t)idx, rec[i].bits };
+	}
+	{
+		char b[600];
+		size_t o = 0;
+
+		for (unsigned i = 0; i < st->nconsts && o < sizeof(b) - 40; i++) {
+			o += (size_t)snprintf(b + o, sizeof(b) - o, " %u=%llx", st->consts[i].index, (unsigned long long)st->consts[i].bits);
+		}
+		lavlog("function %s: %u declared, %u set, specialised with %u:%s", [st->name UTF8String], ndecl, nrec, st->nconsts, b);
+	}
+}
+
+static id
+libNewFunctionConstants(id self, SEL cmd, id name, id constants, NSError ** err)
 {
 	id f = libNewFunction(self, cmd, name);
 
+	fnTakeConstants(f, constants);
 	if (f == nil) {
 		lavError(err, @"MTLLibraryErrorDomain", "no such function");
 	}
@@ -1333,6 +1583,10 @@ static id
 libNewFunctionDescriptor(id self, SEL cmd, id desc, NSError ** err)
 {
 	id f = libNewFunction(self, cmd, desc != nil ? [desc name] : nil);
+
+	if (desc != nil && [desc respondsToSelector:@selector(constantValues)]) {
+		fnTakeConstants(f, [desc constantValues]);
+	}
 
 	if (f == nil) {
 		lavError(err, @"MTLLibraryErrorDomain", "no such function");
@@ -1373,6 +1627,7 @@ fnDealloc(id self, __unused SEL _cmd)
 	[st->library release];
 	[st->name release];
 	[st->label release];
+	free(st->consts);
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel_registerName("dealloc"));
 }
 
@@ -1826,28 +2081,110 @@ runDispatch(struct op * op)
 	return ok;
 }
 
+/* hang hunt: a commit that has run for more than 12 s gets a backtrace of its thread written to the log (SIGUSR2 to it) */
+static volatile pthread_t gCommitThread;
+static volatile int gCommitBusy, gCommitStage, gCommitDumped;
+static volatile time_t gCommitT0;
+
+static void
+lavSigDump(__unused int sig)
+{
+	void * bt[40];
+	int n = backtrace(bt, 40), fd = open(LAV_LOG, O_WRONLY | O_APPEND);
+	char buf[200];
+
+	if (fd < 0) {
+		return;
+	}
+	for (int i = 0; i < n; i++) {
+		Dl_info di;
+		int len;
+
+		if (dladdr(bt[i], &di) && di.dli_fname != NULL) {
+			len = snprintf(buf, sizeof(buf), "stuck commit bt %d: %s %s+%ld  %p image+%#lx\n", i, di.dli_fname, di.dli_sname != NULL ? di.dli_sname : "?",
+			    di.dli_saddr != NULL ? (long)((char *)bt[i] - (char *)di.dli_saddr) : 0L, bt[i], (unsigned long)((char *)bt[i] - (char *)di.dli_fbase));
+		} else {
+			len = snprintf(buf, sizeof(buf), "stuck commit bt %d: %p\n", i, bt[i]);
+		}
+		write(fd, buf, (size_t)len);
+	}
+	close(fd);
+}
+
+static void *
+lavWatchdog(__unused void * arg)
+{
+	for (;;) {
+		sleep(5);
+		if (gCommitBusy && !gCommitDumped && time(NULL) - gCommitT0 > 12) {
+			gCommitDumped = 1;
+			lavlog("commit stuck for %ld s at stage %d: dumping its thread", (long)(time(NULL) - gCommitT0), gCommitStage);
+			pthread_kill(gCommitThread, SIGUSR2);
+		}
+	}
+	return NULL;
+}
+
+__attribute__((constructor)) static void
+lavWatchdogStart(void)
+{
+	pthread_t t;
+
+	signal(SIGUSR2, lavSigDump);
+	if (pthread_create(&t, NULL, lavWatchdog, NULL) == 0) {
+		pthread_detach(t);
+	}
+}
+
 typedef void (^LavHandler)(id);
+
+/* where the time of draws goes (ns, reset at each commit, printed with 'commit time'); filled by runDraw */
+static uint64_t gTSpec, gTCopy, gTBuild, gTSubmit, gNSub, gPixels;
 
 static void cbSyncSurfaces(struct cbstate * st);
 static BOOL runClear(struct op * op);
 static BOOL runDraw(struct op * op);
+static BOOL runTexCopy(struct op * op);
 
 static void
 cbCommit(id self, __unused SEL _cmd)
 {
 	struct cbstate * st = STATE(self, struct cbstate);
 	BOOL ok = YES;
+	uint64_t tKind[8] = { 0 }, tStart = 0, tPrev = 0, tMax = 0, tSync = 0;
+	unsigned tLast = 0, tMaxKind = 0;
 
 	if (st->status >= 2) {
 		return;
 	}
 	st->status = 2;                         /* Committed */
+	gCommitThread = pthread_self();
+	gCommitT0 = time(NULL);
+	gCommitStage = 0;
+	gCommitDumped = 0;
+	gCommitBusy = 1;
+	gTSpec = gTCopy = gTBuild = gTSubmit = gNSub = gPixels = 0;
+	lavlog("commit: %zu ops, %lu drawables, %lu scheduled, %lu completed handlers", st->nops, (unsigned long)[st->drawables count],
+	    (unsigned long)[st->scheduled count], (unsigned long)[st->handlers count]);
 	for (id h in st->scheduled) {
 		((LavHandler)h)(self);
 	}
 	st->status = 3;                         /* Scheduled */
 	pthread_mutex_lock(&gGPULock);
+	tStart = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 	for (size_t i = 0; i < st->nops && ok; i++) {
+		uint64_t to = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+
+		if (i != 0) {
+			tKind[tLast < 8 ? tLast : 7] += to - tPrev;
+			if (to - tPrev > tMax) {
+				tMax = to - tPrev;
+				tMaxKind = tLast;
+			}
+		}
+		tPrev = to;
+		tLast = (unsigned)st->ops[i].kind;
+		gCommitStage = (int)(i * 100) + (int)st->ops[i].kind;
 		switch (st->ops[i].kind) {
 		case OP_FILL:
 			ok = runFill(&st->ops[i]);
@@ -1861,14 +2198,30 @@ cbCommit(id self, __unused SEL _cmd)
 		case OP_DRAW:
 			ok = runDraw(&st->ops[i]);
 			break;
+		case OP_TEXCOPY:
+			ok = runTexCopy(&st->ops[i]);
+			break;
 		default:
 			ok = runDispatch(&st->ops[i]);
 			break;
 		}
 	}
+	if (st->nops != 0) {
+		uint64_t to = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+
+		tKind[tLast < 8 ? tLast : 7] += to - tPrev;
+		if (to - tPrev > tMax) {
+			tMax = to - tPrev;
+			tMaxKind = tLast;
+		}
+		tPrev = to;
+	}
+	gCommitStage = -1;                      /* syncing surfaces */
 	if (ok) {
 		cbSyncSurfaces(st);
 	}
+	tSync = clock_gettime_nsec_np(CLOCK_MONOTONIC) - tPrev;
+	gCommitStage = -2;
 	pthread_mutex_unlock(&gGPULock);
 	cbFreeOps(st);
 	if (ok) {
@@ -1878,9 +2231,20 @@ cbCommit(id self, __unused SEL _cmd)
 	}
 	[st->drawables removeAllObjects];
 	st->status = ok ? 4 : 5;                /* Completed or Error */
+	gCommitBusy = 0;
+	lavlog("commit: %s, running %lu completed handlers", ok ? "completed" : "ERROR", (unsigned long)[st->handlers count]);
+	lavlog("draw phases (ms): specialise %llu, texture copy-in %llu, build stream %llu, submit+wait %llu in %llu submits, %llu kpixels",
+	    (unsigned long long)(gTSpec / 1000000u), (unsigned long long)(gTCopy / 1000000u), (unsigned long long)(gTBuild / 1000000u),
+	    (unsigned long long)(gTSubmit / 1000000u), (unsigned long long)gNSub, (unsigned long long)(gPixels / 1000u));
+	lavlog("commit time: total %llu ms; by op kind (ms) 0:%llu 1:%llu 2:%llu 3:%llu 4:%llu 5:%llu 6:%llu 7+:%llu; sync %llu ms; slowest op kind %u %llu ms",
+	    (unsigned long long)((clock_gettime_nsec_np(CLOCK_MONOTONIC) - tStart) / 1000000u), (unsigned long long)(tKind[0] / 1000000u),
+	    (unsigned long long)(tKind[1] / 1000000u), (unsigned long long)(tKind[2] / 1000000u), (unsigned long long)(tKind[3] / 1000000u),
+	    (unsigned long long)(tKind[4] / 1000000u), (unsigned long long)(tKind[5] / 1000000u), (unsigned long long)(tKind[6] / 1000000u),
+	    (unsigned long long)(tKind[7] / 1000000u), (unsigned long long)(tSync / 1000000u), tMaxKind, (unsigned long long)(tMax / 1000000u));
 	for (id h in st->handlers) {
 		((LavHandler)h)(self);
 	}
+	lavlog("commit: handlers returned");
 }
 
 static void
@@ -2185,11 +2549,17 @@ registerObjectClasses(Class device)
 		ADD(gBlitClass, "setLabel:", encSetLabel, "v@:@");
 		ADD(gBlitClass, "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:", encCopy, "v@:@Q@QQ");
 		ADD(gBlitClass, "fillBuffer:range:value:", encFill, "v@:@{_NSRange=QQ}C");
+		ADD(gBlitClass, "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+		    encCopyTexture, "v@:@QQ{_MTLOrigin=QQQ}{_MTLSize=QQQ}@QQ{_MTLOrigin=QQQ}");
+		ADD(gBlitClass, "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:options:",
+		    encCopyTextureOpt, "v@:@QQ{_MTLOrigin=QQQ}{_MTLSize=QQQ}@QQ{_MTLOrigin=QQQ}Q");
+		ADD(gBlitClass, "generateMipmapsForTexture:", encGenMips, "v@:@");
 		ADD(gBlitClass, "endEncoding", encEnd, "v@:");
 		ADD(gBlitClass, "synchronizeResource:", encNothing, "v@:@");
 		objc_registerClassPair(gBlitClass);
 	}
 	registerComputeClasses(device);
+	installConstantHooks();
 	registerRenderClasses(device);
 }
 
@@ -2198,6 +2568,11 @@ lavenderMetalLoad(void)
 {
 	Class cls;
 
+	if (strcmp(getprogname(), "SpringBoard") == 0) {
+		/* one GPU client only: backboardd. SpringBoard drew its lock screen glyphs differently when it was given a Metal device */
+		lavlog("SpringBoard gets no Metal device");
+		return;
+	}
 	gDeviceBase = objc_getClass("_MTLDevice");
 	if (gDeviceBase == Nil) {
 		lavlog("the system has no _MTLDevice; this plug-in registers nothing");

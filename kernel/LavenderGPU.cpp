@@ -26,6 +26,9 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
+#include <pexpert/pexpert.h>
+#include <kern/thread.h>
 #include <mach/vm_param.h>
 #include <sys/systm.h>
 
@@ -45,7 +48,7 @@ enum {
 	kLavMetal       = 5,
 };
 
-#define LAV_BUFFERS     64
+#define LAV_BUFFERS     256
 #define LAV_BUFFER_MAX  (16ull << 20)
 #define LAV_SUBMIT_MAX  16384           /* bytes of PM4 words in one stream */
 
@@ -70,6 +73,63 @@ struct lav_submit_buf {
 static IOLock * gLavLock;
 static uint32_t gLavSubmits, gLavLast;
 
+/*
+ * The pool: physically contiguous memory below 4 GB is nearly all gone a few minutes after boot (8 MB and 2 MB requests fail), and
+ * the GPU needs buffers in one piece. So the service takes one big block while the system is still young (LavenderGPUStart) and
+ * hands pieces of it out, a page at a time; when there is no pool a buffer is its own allocation, as before.
+ */
+#define LAV_POOL_PAGE   4096ull
+static IOBufferMemoryDescriptor * gPool;
+static uint64_t gPoolPhys, gPoolSize;
+static uint8_t * gPoolUsed;                     /* one byte per page, under gLavLock */
+static uint32_t gPoolPages;
+
+static void
+lavPoolInit(void)
+{
+	static const uint64_t sizes[] = { 128ull << 20, 64ull << 20, 32ull << 20, 16ull << 20, 8ull << 20, 4ull << 20 };
+
+	for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]) && gPool == NULL; i++) {
+		printf("LavenderGPU: pool of %llu MB: trying\n", sizes[i] >> 20);
+		IOBufferMemoryDescriptor * m = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, sizes[i], 0x00000000FFFFF000ULL);
+
+		IOLog("LavenderGPU: pool of %llu MB: %s\n", sizes[i] >> 20, m != NULL ? "got it" : "no contiguous memory");
+		if (m != NULL) {
+			gPoolPages = (uint32_t)(sizes[i] / LAV_POOL_PAGE);
+			gPoolUsed = (uint8_t *)IOMalloc(gPoolPages);
+			if (gPoolUsed == NULL) {
+				m->release();
+				return;
+			}
+			bzero(gPoolUsed, gPoolPages);
+			gPoolPhys = m->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+			gPoolSize = sizes[i];
+			gPool = m;
+			IOLog("LavenderGPU: pool: pa %llx size %llu MB\n", gPoolPhys, gPoolSize >> 20);
+		}
+	}
+	if (gPool == NULL) {
+		IOLog("LavenderGPU: no pool: buffers are allocated one by one\n");
+	}
+}
+
+/* the first run of NPAGES free pages of the pool (gLavLock held), marked used; the page it starts at, or -1 */
+static int64_t
+lavPoolTake(uint32_t npages)
+{
+	uint32_t run = 0;
+
+	for (uint32_t i = 0; i < gPoolPages; i++) {
+		run = gPoolUsed[i] ? 0 : run + 1;
+		if (run == npages) {
+			memset(gPoolUsed + (i + 1 - npages), 1, npages);
+			return (int64_t)(i + 1 - npages);
+		}
+	}
+	return -1;
+}
+
 class LavenderGPU : public IOService
 {
 	OSDeclareDefaultStructors(LavenderGPU);
@@ -92,6 +152,44 @@ LavenderGPU::start(IOService * provider)
 	return true;
 }
 
+/*
+ * Called from iokit_post_constructor_init, before any matching: the pool is taken while the low memory is still whole. By the time the
+ * GPU's ring comes up (~110 s into boot) nothing bigger than 4 MB is left in one piece below 4 GB.
+ */
+static volatile uint32_t gPoolState;            /* 0 untried, 1 the early thread is on it, 2 it is finished */
+
+static void
+lavPoolThread(void * arg, wait_result_t wr)
+{
+	(void)arg;
+	(void)wr;
+	printf("LavenderGPU: early pool: thread start\n");
+	lavPoolInit();
+	printf("LavenderGPU: early pool: done, pool %s\n", gPool != NULL ? "ok" : "none");
+	gPoolState = 2;
+	thread_terminate(current_thread());
+}
+
+extern "C" void
+LavenderGPUPoolEarly(void)
+{
+	uint32_t v = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("lavgpu", &v, sizeof(v)) || v == 0) {
+		return;
+	}
+	if (gLavLock == NULL) {
+		gLavLock = IOLockAlloc();
+	}
+	gPoolState = 1;
+	if (kernel_thread_start(lavPoolThread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	} else {
+		gPoolState = 0;
+	}
+}
+
 void
 LavenderGPUStart(void)
 {
@@ -100,6 +198,12 @@ LavenderGPUStart(void)
 
 	if (gLavLock == NULL) {
 		gLavLock = IOLockAlloc();
+	}
+	for (int w = 0; gPoolState == 1 && w < 1200; w++) {   /* the early thread may still be looking: up to 2 minutes */
+		IOSleep(100);
+	}
+	if (gPool == NULL && gPoolState != 1) {
+		lavPoolInit();
 	}
 	gpu = OSTypeAlloc(LavenderGPU);
 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
@@ -151,8 +255,10 @@ class LavenderGPUUserClient : public IOUserClient
 	OSDeclareDefaultStructors(LavenderGPUUserClient);
 
 	task_t                          fTask;
-	IOBufferMemoryDescriptor *      fMemory[LAV_BUFFERS];   /* handle n is fMemory[n - 1] */
+	IOMemoryDescriptor *            fMemory[LAV_BUFFERS];   /* handle n is fMemory[n - 1] */
 	uint64_t                        fAddress[LAV_BUFFERS];
+	uint32_t                        fPoolAt[LAV_BUFFERS];   /* the pool page the buffer starts at ... */
+	uint32_t                        fPoolN[LAV_BUFFERS];    /* ... and its length in pages (0: not from the pool) */
 
 	IOReturn bufferNew(struct lav_buf_new * request);
 	IOReturn bufferFree(uint32_t handle);
@@ -189,6 +295,10 @@ LavenderGPUUserClient::clientClose(void)
 		if (fMemory[i] != NULL) {
 			fMemory[i]->release();
 			fMemory[i] = NULL;
+			if (fPoolN[i] != 0) {
+				bzero(gPoolUsed + fPoolAt[i], fPoolN[i]);
+				fPoolN[i] = 0;
+			}
 		}
 	}
 	IOLockUnlock(gLavLock);
@@ -207,7 +317,8 @@ LavenderGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, 
 	if (type >= 1 && type <= LAV_BUFFERS && fMemory[type - 1] != NULL) {
 		fMemory[type - 1]->retain();
 		*memory = fMemory[type - 1];
-		*options = 0;
+		*options = fPoolN[type - 1] != 0 ? kIOMapWriteCombineCache : 0;
+		IOLog("LavenderGPU: map of buffer %u (%s)\n", (unsigned)type, fPoolN[type - 1] != 0 ? "pool" : "own");
 		ret = kIOReturnSuccess;
 	}
 	IOLockUnlock(gLavLock);
@@ -217,17 +328,42 @@ LavenderGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, 
 IOReturn
 LavenderGPUUserClient::bufferNew(struct lav_buf_new * request)
 {
-	IOBufferMemoryDescriptor * memory;
+	IOMemoryDescriptor * memory = NULL;
 	uint64_t size = round_page_64(request->size);
 	uint32_t slot = LAV_BUFFERS;
+	uint32_t at = 0, npages = 0;
 
 	if (request->size == 0 || size > LAV_BUFFER_MAX) {
 		return kIOReturnBadArgument;
 	}
-	/* below 4 GB and in one piece: the GPU's page table is the identity of the first four gigabytes */
-	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
-	    size, 0x00000000FFFFF000ULL);
+	if (gPool != NULL) {
+		int64_t first;
+
+		npages = (uint32_t)(size / LAV_POOL_PAGE);
+		IOLockLock(gLavLock);
+		first = lavPoolTake(npages);
+		IOLockUnlock(gLavLock);
+		if (first >= 0) {
+			at = (uint32_t)first;
+			/* a piece of the pool's own (wired) descriptor: a physical-range descriptor made here panics when mapped or DMA'd */
+			memory = IOSubMemoryDescriptor::withSubRange(gPool, (uint64_t)at * LAV_POOL_PAGE, size, kIODirectionInOut);
+			if (memory == NULL) {
+				IOLockLock(gLavLock);
+				bzero(gPoolUsed + at, npages);
+				IOLockUnlock(gLavLock);
+			} else {
+				/* what a service buffer is: zeroed (the pool's pieces were somebody's before) */
+				bzero((uint8_t *)gPool->getBytesNoCopy() + (uint64_t)at * LAV_POOL_PAGE, size);
+			}
+		}
+	}
+	if (memory == NULL) {
+		npages = 0;
+		/* below 4 GB and in one piece: the GPU's page table is the identity of the first four gigabytes */
+		memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
+		    size, 0x00000000FFFFF000ULL);
+	}
 	if (memory == NULL) {
 		IOLog("LavenderGPU: no contiguous memory for a buffer of %llu bytes\n", size);
 		return kIOReturnNoMemory;
@@ -240,17 +376,22 @@ LavenderGPUUserClient::bufferNew(struct lav_buf_new * request)
 		}
 	}
 	if (slot == LAV_BUFFERS) {
+		if (npages != 0) {
+			bzero(gPoolUsed + at, npages);
+		}
 		IOLockUnlock(gLavLock);
 		memory->release();
 		return kIOReturnNoResources;
 	}
 	fMemory[slot] = memory;
-	fAddress[slot] = memory->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+	fPoolAt[slot] = at;
+	fPoolN[slot] = npages;
+	fAddress[slot] = npages != 0 ? gPoolPhys + (uint64_t)at * LAV_POOL_PAGE : memory->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
 	request->handle = slot + 1;
 	request->address = fAddress[slot];
 	request->size = size;
 	IOLockUnlock(gLavLock);
-	IOLog("LavenderGPU: buffer %u: pa %llx size %llu\n", request->handle, request->address, size);
+	IOLog("LavenderGPU: buffer %u: pa %llx size %llu%s\n", request->handle, request->address, size, npages != 0 ? " (pool)" : "");
 	return kIOReturnSuccess;
 }
 
@@ -263,6 +404,10 @@ LavenderGPUUserClient::bufferFree(uint32_t handle)
 	if (handle >= 1 && handle <= LAV_BUFFERS && fMemory[handle - 1] != NULL) {
 		fMemory[handle - 1]->release();
 		fMemory[handle - 1] = NULL;
+		if (fPoolN[handle - 1] != 0) {
+			bzero(gPoolUsed + fPoolAt[handle - 1], fPoolN[handle - 1]);
+			fPoolN[handle - 1] = 0;
+		}
 		ret = kIOReturnSuccess;
 	}
 	IOLockUnlock(gLavLock);
@@ -479,7 +624,8 @@ LavenderGPUUserClient::selfTest(void)
 	if (ret != kIOReturnSuccess || bn.handle == 0) {
 		return false;
 	}
-	words = (volatile uint32_t *)fMemory[bn.handle - 1]->getBytesNoCopy();
+	words = fPoolN[bn.handle - 1] != 0 ? (volatile uint32_t *)((uint8_t *)gPool->getBytesNoCopy() + (uint64_t)fPoolAt[bn.handle - 1] * LAV_POOL_PAGE) :
+	    (volatile uint32_t *)((IOBufferMemoryDescriptor *)fMemory[bn.handle - 1])->getBytesNoCopy();
 
 	stream[0] = lav_pkt7(61, 3);                    /* CP_MEM_WRITE: address, then the words */
 	stream[1] = (uint32_t)bn.address;

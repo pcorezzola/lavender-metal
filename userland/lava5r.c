@@ -9,6 +9,28 @@
 #include "lava5.h"
 #define A5XX_MAX_RENDER_TARGETS 8
 
+/* performance experiments: bit mask in /var/tmp/lavexp (decimal), read once per process. 1: RB DP2 bit, 2: CCU cfg for A512 bypass */
+#include <stdio.h>
+unsigned
+lav5_exp(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		FILE * f = fopen("/var/tmp/lavexp", "r");
+		int x = 0;
+
+		if (f != NULL) {
+			if (fscanf(f, "%d", &x) != 1) {
+				x = 0;
+			}
+			fclose(f);
+		}
+		v = x;
+	}
+	return (unsigned)v;
+}
+
 static inline uint32_t
 fui(float f)
 {
@@ -113,7 +135,7 @@ restore(struct st * s)
 	set(s, REG_A5XX_SP_FS_CONFIG_MAX_CONST, 0);
 	zeros(s, REG_A5XX_UNKNOWN_E292, 2);
 	set(s, REG_A5XX_RB_MODE_CNTL, 0x44);
-	set(s, REG_A5XX_RB_DBG_ECO_CNTL, 0x00100000);
+	set(s, REG_A5XX_RB_DBG_ECO_CNTL, 0x00100000 | ((lav5_exp() & 1) ? 0x200u : 0));      /* bit 9: DP2 workaround (kgsl a5xx_start) */
 	set(s, REG_A5XX_VFD_MODE_CNTL, 0);
 	set(s, REG_A5XX_PC_MODE_CNTL, 0x1f);
 	set(s, REG_A5XX_SP_MODE_CNTL, 0x1e);
@@ -327,7 +349,43 @@ size_t
 lav5_build_render(uint32_t * words, size_t cap, const struct lav5_render * r, const char ** why)
 {
 	struct st st = { words, 0, cap, 0 }, * s = &st;
-	const struct lav5_stage * vs = r->vs, * fs = r->fs;
+	struct lav5_render rmod;
+	struct lav5_stage fsmod;
+	const struct lav5_stage * vs = r->vs, * fs;
+	if (r->nrt == 2 && r->blend.writemask == 0 && r->blend_x[1].writemask != 0) {
+		/* colour target 0 is masked and target 1 is the one written: draw to target 1 alone, as if it were target 0 */
+		rmod = *r;
+		fsmod = *r->fs;
+		rmod.rt_gpu = r->rt[1].gpu;
+		rmod.rt_pitch = r->rt[1].pitch;
+		rmod.rt_format = r->rt[1].format;
+		rmod.blend = r->blend_x[1];
+		rmod.nrt = 1;
+		rmod.rt[0] = r->rt[1];
+		fsmod.color_regid[0] = r->fs->color_regid[1];
+		fsmod.color_half[0] = r->fs->color_half[1];
+		fsmod.ncolor = r->fs->ncolor > 1 ? r->fs->ncolor - 1 : 1;
+		r = &rmod;
+	}
+	if (r->nrt == 2 && r->blend.writemask != 0 && r->blend_x[1].writemask == 0) {
+		/* target 1 is masked (nothing would be written) and nothing reads it back: draw to target 0 alone, saves its memory traffic */
+		int reads1 = 0;
+
+		for (unsigned q = 0; q < 32; q++) {
+			reads1 |= r->fs->fb_target[q] == 2;
+		}
+		if (!reads1) {
+			rmod = *r;
+			fsmod = *r->fs;
+			rmod.nrt = 1;
+			fsmod.ncolor = 1;
+			r = &rmod;
+		}
+	}
+	fs = r->fs;
+	if (r == &rmod) {
+		fs = &fsmod;
+	}
 	struct lav5_link lk = *r->link;
 	const struct lav5_link * l = &lk;
 	uint32_t clip_cull = vs->clip_mask | vs->cull_mask, clip0_loc = 0xff, clip1_loc = 0xff;
@@ -407,7 +465,7 @@ lav5_build_render(uint32_t * words, size_t cap, const struct lav5_render * r, co
 	set(s, REG_A5XX_PC_POWER_CNTL, 1);
 	set(s, REG_A5XX_VFD_POWER_CNTL, 1);
 	wfi(s);
-	set(s, REG_A5XX_RB_CCU_CNTL, 0x10000000);
+	set(s, REG_A5XX_RB_CCU_CNTL, (lav5_exp() & 2) ? 0x08000000 : 0x10000000);
 	set(s, REG_A5XX_RB_CNTL, A5XX_RB_CNTL_WIDTH(0) | A5XX_RB_CNTL_HEIGHT(0) | A5XX_RB_CNTL_BYPASS);
 	pkt4(s, REG_A5XX_GRAS_SC_WINDOW_SCISSOR_TL, 2);
 	out(s, A5XX_GRAS_SC_WINDOW_SCISSOR_TL_X(0) | A5XX_GRAS_SC_WINDOW_SCISSOR_TL_Y(0));
@@ -585,7 +643,7 @@ lav5_build_render(uint32_t * words, size_t cap, const struct lav5_render * r, co
 	set(s, REG_A5XX_SP_FS_CTRL_REG0,
 	    COND(fs->total_in > 0, A5XX_SP_FS_CTRL_REG0_VARYING) | 0x40002 | COND(fs_instrlen != 0, A5XX_SP_FS_CTRL_REG0_BUFFER) |
 	    A5XX_SP_FS_CTRL_REG0_THREADSIZE(fssz) | A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT((unsigned)(fs->k.max_half_reg + 1)) |
-	    A5XX_SP_FS_CTRL_REG0_FULLREGFOOTPRINT((unsigned)(fs->k.max_reg + 1)) | A5XX_SP_FS_CTRL_REG0_BRANCHSTACK(fs->k.branchstack) |
+	    A5XX_SP_FS_CTRL_REG0_FULLREGFOOTPRINT((unsigned)(fs->k.max_reg < 0 ? 1 : fs->k.max_reg + 1)) | A5XX_SP_FS_CTRL_REG0_BRANCHSTACK(fs->k.branchstack) |
 	    COND(fs->need_pixlod, A5XX_SP_FS_CTRL_REG0_PIXLODENABLE));
 	set(s, REG_A5XX_HLSQ_UPDATE_CNTL, 0x020fffff);
 	set(s, REG_A5XX_VPC_GS_SIV_CNTL, 0x0000ffff);
@@ -751,6 +809,17 @@ lav5_build_render(uint32_t * words, size_t cap, const struct lav5_render * r, co
 				ns = i + 1;
 			}
 		}
+		/* a stage may sample a unit nothing is bound at (a texture that was refused is nil): give every unit up to the highest
+		 * a valid descriptor and sampler, or the TP reads a width-0 image and the CP never finishes the draw */
+		/* the uber shader samples whichever unit its (unspecialised) path names, bound or not: all 16 get a descriptor */
+		nt = fs->ntexslots > 16 && fs->ntexslots <= 32 ? fs->ntexslots : 16;
+		ns = nt;
+		if (nt > ns) {
+			ns = nt;
+		}
+		if (ns > nt) {
+			nt = ns;
+		}
 		if (ns > 0) {
 			pkt7(s, CP_LOAD_STATE4, 3 + 4 * ns);
 			out(s, CP_LOAD_STATE4_0_DST_OFF(0) | CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) | CP_LOAD_STATE4_0_STATE_BLOCK(SB4_FS_TEX) |
@@ -778,17 +847,53 @@ lav5_build_render(uint32_t * words, size_t cap, const struct lav5_render * r, co
 			out(s, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) | CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
 			out(s, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
 			for (i = 0; i < nt; i++) {
-				const struct lav5_tex * t = &r->tex[i];
-				uint32_t sx = A5XX_TEX_X, sz = A5XX_TEX_Z;
+				struct lav5_tex dummy;
+
+				memset(&dummy, 0, sizeof(dummy));
+				const struct lav5_tex * t = i < 16 ? &r->tex[i] : &dummy;
+				uint32_t sx = A5XX_TEX_X, sy = A5XX_TEX_Y, sz = A5XX_TEX_Z, sw = A5XX_TEX_W;
+
+				if (i < 32 && fs->fb_target[i] != 0 && fs->fb_target[i] <= 8) {
+					/* a framebuffer fetch: the colour attachment the shader reads, as a texture at this unit */
+					const struct lav5_rt * rt = &r->rt[fs->fb_target[i] - 1];
+
+					memset(&dummy, 0, sizeof(dummy));
+					dummy.gpu = rt->gpu;
+					dummy.width = r->rt_width;
+					dummy.height = r->rt_height;
+					dummy.pitch = rt->pitch;
+					dummy.bgra = rt->format == 0;
+					dummy.nch = 4;
+					dummy.valid = 1;
+					t = &dummy;
+				} else if (!t->valid) {
+					memset(&dummy, 0, sizeof(dummy));
+					dummy.gpu = r->hole_gpu;
+					dummy.width = dummy.height = 1;
+					dummy.pitch = 64;
+					dummy.nch = 4;
+					t = &dummy;
+				}
+				uint32_t tfmt = t->tfmt ? t->tfmt : (uint32_t)TFMT5_8_8_8_8_UNORM;
 
 				if (t->valid && t->bgra) {
 					sx = A5XX_TEX_Z;
 					sz = A5XX_TEX_X;
 				}
-				out(s, A5XX_TEX_CONST_0_FMT(TFMT5_8_8_8_8_UNORM) | A5XX_TEX_CONST_0_TILE_MODE(TILE5_LINEAR) | A5XX_TEX_CONST_0_SWIZ_X(sx) |
-				    A5XX_TEX_CONST_0_SWIZ_Y(A5XX_TEX_Y) | A5XX_TEX_CONST_0_SWIZ_Z(sz) | A5XX_TEX_CONST_0_SWIZ_W(A5XX_TEX_W));
+				if (t->valid && t->nch != 0 && t->nch < 4 && !t->alpha_only) {
+					/* fdl6_format_swiz: the channels a format lacks read 0, and w reads 1 */
+					if (t->nch < 2) {
+						sy = A5XX_TEX_ZERO;
+					}
+					if (t->nch < 3) {
+						sz = A5XX_TEX_ZERO;
+					}
+					sw = A5XX_TEX_ONE;
+				}
+				out(s, A5XX_TEX_CONST_0_FMT(tfmt) | A5XX_TEX_CONST_0_TILE_MODE(TILE5_LINEAR) | A5XX_TEX_CONST_0_SWIZ_X(sx) |
+				    A5XX_TEX_CONST_0_SWIZ_Y(sy) | A5XX_TEX_CONST_0_SWIZ_Z(sz) | A5XX_TEX_CONST_0_SWIZ_W(sw) | COND(t->srgb, A5XX_TEX_CONST_0_SRGB));
 				out(s, A5XX_TEX_CONST_1_WIDTH(t->width) | A5XX_TEX_CONST_1_HEIGHT(t->height));
-				out(s, A5XX_TEX_CONST_2_PITCHALIGN(0) | A5XX_TEX_CONST_2_PITCH(t->pitch) | A5XX_TEX_CONST_2_TYPE(A5XX_TEX_2D));
+				out(s, A5XX_TEX_CONST_2_PITCHALIGN(0) | A5XX_TEX_CONST_2_PITCH(t->pitch) | A5XX_TEX_CONST_2_TYPE(t->is1d ? A5XX_TEX_1D : A5XX_TEX_2D));
 				out(s, A5XX_TEX_CONST_3_ARRAY_PITCH((t->pitch * t->height + 4095) & ~4095u));
 				out(s, (uint32_t)t->gpu);
 				out(s, (uint32_t)(t->gpu >> 32) | A5XX_TEX_CONST_5_DEPTH(1));
@@ -884,4 +989,97 @@ lav5_build_render(uint32_t * words, size_t cap, const struct lav5_render * r, co
 		return 0;
 	}
 	return s->n;
+}
+
+/*
+ * A scatter copy by the 2D engine: `src_gpu` (linear, the texture) is copied, in units of `runlen` bytes (a multiple of 8192), to the
+ * physical addresses dst_pa[i] taken from the surface's runs, by CP_BLIT as R8 images 8192 wide (the sequence of step 18 of the
+ * kernel, which copied 64 bytes right). src_off[i] is where run i starts in the source. Returns the words used, or 0 when it
+ * does not fit.
+ */
+size_t
+lav5_build_copy(uint32_t * words, size_t cap, uint64_t src_gpu, const uint64_t * dst_pa, const uint64_t * src_off,
+    const uint32_t * len, unsigned nruns, uint64_t flush_gpu)
+{
+	struct st st = { words, 0, cap, 0 }, * s = &st;
+
+	pkt4(s, REG_A5XX_UCHE_CACHE_INVALIDATE_MIN_LO, 5);
+	out(s, 0);
+	out(s, 0);
+	out(s, 0);
+	out(s, 0);
+	out(s, 0x12);
+	wfi(s);
+	set(s, REG_A5XX_RB_RENDER_CNTL, 0x8);
+	set(s, 0x2100, 0x86000000u);                    /* RB_2D_BLIT_CNTL: ROP_COPY, UNORM8, bit 31 */
+	set(s, 0x2180, 0x86000000u);                    /* GRAS_2D_BLIT_CNTL */
+	set(s, 0x2184, 0x9);
+	set(s, REG_A5XX_RB_CNTL, 1u << 17);             /* BYPASS */
+	set(s, REG_A5XX_RB_MODE_CNTL, 1u << 1);
+	set(s, REG_A5XX_SP_MODE_CNTL, 0xc);
+	set(s, REG_A5XX_TPL1_MODE_CNTL, 0x244u | (1u << 7));
+	set(s, REG_A5XX_HLSQ_MODE_CNTL, 0x2);
+	set(s, REG_A5XX_GRAS_CL_CNTL, 0x181);
+	pkt7(s, CP_SET_RENDER_MODE, 1);
+	out(s, 5);                                      /* BLIT2D */
+	set(s, 0x2040, 0x3u << 3);                      /* SP_A2D_OUTPUT_INFO: float, R8_UNORM */
+	set(s, 0x2181, 0x3);
+	set(s, 0x2182, 0x3);
+	for (unsigned i = 0; i < nruns; i++) {
+		uint64_t sp = src_gpu + src_off[i], dp = dst_pa[i];
+		unsigned rows = len[i] / 8192, pitch = 8192 >> 6, apitch = (8192 * rows) >> 6;
+
+		pkt4(s, 0x2107, 9);                     /* RB_2D_SRC_INFO .. */
+		out(s, 0x3);
+		out(s, (uint32_t)sp);
+		out(s, (uint32_t)(sp >> 32));
+		out(s, pitch | (apitch << 16));
+		for (int k = 0; k < 5; k++) {
+			out(s, 0);
+		}
+		pkt4(s, 0x2110, 9);                     /* RB_2D_DST_INFO .. */
+		out(s, 0x3);
+		out(s, (uint32_t)dp);
+		out(s, (uint32_t)(dp >> 32));
+		out(s, pitch | (apitch << 16));
+		for (int k = 0; k < 5; k++) {
+			out(s, 0);
+		}
+		pkt4(s, 0x2000, 5);                     /* TPL1_A2D_SRC_TEXTURE_INFO .. */
+		out(s, 0x3);
+		out(s, 8192u | (rows << 15));
+		out(s, (uint32_t)sp);
+		out(s, (uint32_t)(sp >> 32));
+		out(s, pitch << 9);
+		pkt7(s, CP_BLIT, 5);
+		out(s, 3);                              /* BLIT_OP_SCALE */
+		out(s, 0);
+		out(s, 8191u | ((rows - 1) << 16));
+		out(s, 0);
+		out(s, 8191u | ((rows - 1) << 16));
+	}
+	pkt7(s, CP_SET_RENDER_MODE, 1);
+	out(s, 8);                                      /* END2D */
+	wfi(s);
+	pkt7(s, CP_EVENT_WRITE, 4);
+	out(s, PC_CCU_FLUSH_COLOR_TS);
+	out(s, (uint32_t)flush_gpu);
+	out(s, (uint32_t)(flush_gpu >> 32));
+	out(s, 0xc0c0c0c1);
+	wfi(s);
+	return s->over ? 0 : s->n;
+}
+
+/* debug: one dword written by CP_MEM_WRITE (no 2D engine) to a physical address, for the test above 4 GB */
+size_t
+lav5_build_memwrite(uint32_t * words, size_t cap, uint64_t pa, uint32_t val)
+{
+	struct st st = { words, 0, cap, 0 }, * s = &st;
+
+	pkt7(s, 0x3d, 3);
+	out(s, (uint32_t)pa);
+	out(s, (uint32_t)(pa >> 32));
+	out(s, val);
+	wfi(s);
+	return s->over ? 0 : s->n;
 }

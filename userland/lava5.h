@@ -92,6 +92,8 @@ struct lav5_stage {
 	uint32_t ncolor;
 	uint32_t depth_regid;
 	uint32_t need_pixlod, has_kill, writes_pos;
+	uint8_t fb_target[32];      /* per texture unit: n + 1 when the stage reads colour attachment n there (framebuffer fetch), else 0 */
+	uint32_t ntexslots;         /* texture units the stage uses (the fetch units included) */
 };
 
 struct lav5_link {
@@ -111,12 +113,17 @@ struct lav5_vbuf {
 	uint32_t stride;
 };
 
-/* a texture bound for the fragment stage: linear 2D, 8888 */
+/* a texture bound for the fragment stage: linear, 2D (or 1D); an a5xx TFMT5_* format with `nch` channels in memory */
 struct lav5_tex {
 	uint64_t gpu;
 	uint32_t width, height, pitch;
 	uint32_t bgra;                              /* 1: B,G,R,A in memory (bgra8Unorm), 0: R,G,B,A */
 	uint32_t valid;
+	uint32_t tfmt;                              /* TFMT5_*; 0 (TFMT5_NONE... see below) means 8888 as before */
+	uint32_t nch;                               /* channels the format holds (1..4); the others read 0, and w reads 1 */
+	uint32_t alpha_only;                        /* A8: the identity swizzle already reads (0, 0, 0, a) */
+	uint32_t is1d;
+	uint32_t srgb;
 };
 
 /* a sampler: filters 0 nearest / 1 linear; wrap 0 repeat / 1 clamp to edge / 2 mirror repeat */
@@ -179,6 +186,12 @@ const char * lav5_refuse_stage(const struct lav5_stage * s);
 uint32_t lav5_pvtmem_bytes(const struct lav5_stage * s);
 
 size_t lav5_build_render(uint32_t * out, size_t cap, const struct lav5_render * r, const char ** why);
+
+/* the scatter copy of a texture into the physical runs of an IOSurface, by the 2D engine; and the experiment mask (/var/tmp/lavexp) */
+size_t lav5_build_copy(uint32_t * words, size_t cap, uint64_t src_gpu, const uint64_t * dst_pa, const uint64_t * src_off,
+    const uint32_t * len, unsigned nruns, uint64_t flush_gpu);
+unsigned lav5_exp(void);
+size_t lav5_build_memwrite(uint32_t * words, size_t cap, uint64_t pa, uint32_t val);
 
 /* the words of the stream; returns how many, 0 with *why set (a string literal) when the dispatch is refused */
 size_t lav5_build(uint32_t * out, size_t cap, const struct lav5_dispatch * d, const char ** why);

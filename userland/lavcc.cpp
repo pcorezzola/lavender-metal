@@ -1,6 +1,8 @@
 // lavcc: the compiler of hakios-metal (MIT) behind a C interface, for the plug-in: a .metallib's bytes in, a function by
 // name, a lav5_kernel out (machine code and the fields the A5xx dispatch builds its stream from).
 #include <cstdio>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -10,6 +12,10 @@
 #include <memory>
 #include <cstdio>
 #include "hakios-metal/compiler.hpp"
+extern "C" {
+#include "air_module.h"
+#include "util/ralloc.h"
+}
 #include "hakios-metal/metallib.hpp"
 #include "lava5.h"
 #include "lavcc.h"
@@ -190,9 +196,12 @@ static void flatten_stage(const Stage& s, const std::vector<Resource>& resources
     out->need_pixlod = s.needPixlod;
     out->has_kill = s.hasKill;
     out->writes_pos = s.writesPos;
+    out->ntexslots = s.k.numTextureSlots;
+    for (uint32_t i = 0; i < 32 && i < kMaxTextureSlots; i++) out->fb_target[i] = s.k.textures[i].fbTarget;
 }
 
-static std::unique_ptr<CompiledStage> stage_of(struct lavcc_lib* l, const char* name, uint8_t type, std::string* why)
+static std::unique_ptr<CompiledStage> stage_of(struct lavcc_lib* l, const char* name, uint8_t type, std::string* why,
+                                               const FunctionConstants& constants = {}, const KnownBuffer* known = nullptr)
 {
     const MetalFunction* fn = l->lib.find(name);
     if (!fn) { *why = std::string("no function ") + name; return nullptr; }
@@ -200,16 +209,70 @@ static std::unique_ptr<CompiledStage> stage_of(struct lavcc_lib* l, const char* 
     const uint8_t* bc = nullptr;
     uint64_t n = 0;
     if (!l->lib.bitcode(*fn, &bc, &n)) { *why = std::string("no bitcode for ") + name; return nullptr; }
-    return compileStage(bc, n, why);
+    return compileStage(bc, n, why, constants, 0, known);
 }
+
+extern "C" int lavcc_compile_program_c(struct lavcc_lib* lv, const char* vname, const struct lavcc_const* vc, unsigned nvc,
+                                       struct lavcc_lib* lf, const char* fname, const struct lavcc_const* fc, unsigned nfc,
+                                       struct lav5_stage* vs, struct lav5_stage* fs, struct lav5_link* link, char* why, size_t whysize);
 
 extern "C" int lavcc_compile_program(struct lavcc_lib* lv, const char* vname, struct lavcc_lib* lf, const char* fname,
                                      struct lav5_stage* vs, struct lav5_stage* fs, struct lav5_link* link, char* why, size_t whysize)
 {
+    return lavcc_compile_program_c(lv, vname, nullptr, 0, lf, fname, nullptr, 0, vs, fs, link, why, whysize);
+}
+
+static int compile_program(struct lavcc_lib* lv, const char* vname, const struct lavcc_const* vc, unsigned nvc,
+                           struct lavcc_lib* lf, const char* fname, const struct lavcc_const* fc, unsigned nfc, const KnownBuffer* known,
+                           struct lav5_stage* vs, struct lav5_stage* fs, struct lav5_link* link, char* why, size_t whysize);
+
+extern "C" int lavcc_compile_program_c(struct lavcc_lib* lv, const char* vname, const struct lavcc_const* vc, unsigned nvc,
+                                       struct lavcc_lib* lf, const char* fname, const struct lavcc_const* fc, unsigned nfc,
+                                       struct lav5_stage* vs, struct lav5_stage* fs, struct lav5_link* link, char* why, size_t whysize)
+{
+    return compile_program(lv, vname, vc, nvc, lf, fname, fc, nfc, nullptr, vs, fs, link, why, whysize);
+}
+
+extern "C" int lavcc_compile_program_known(struct lavcc_lib* lv, const char* vname, const struct lavcc_const* vc, unsigned nvc,
+                                           struct lavcc_lib* lf, const char* fname, const struct lavcc_const* fc, unsigned nfc,
+                                           unsigned binding, const uint8_t* bytes, const uint8_t* fold, size_t length,
+                                           struct lav5_stage* vs, struct lav5_stage* fs, struct lav5_link* link, char* why, size_t whysize)
+{
+    KnownBuffer kb;
+    kb.binding = binding;
+    kb.bytes.assign(bytes, bytes + length);
+    kb.fold.assign(fold, fold + length);
+    return compile_program(lv, vname, vc, nvc, lf, fname, fc, nfc, &kb, vs, fs, link, why, whysize);
+}
+
+extern "C" int lavcc_control_bytes(struct lavcc_lib* lf, const char* fname, const struct lavcc_const* fc, unsigned nfc, unsigned binding,
+                                   size_t length, uint8_t* mask, char* why, size_t whysize)
+{
+    const MetalFunction* fn = lf->lib.find(fname);
+    const uint8_t* bc = nullptr;
+    uint64_t n = 0;
+    if (!fn || !lf->lib.bitcode(*fn, &bc, &n)) { snprintf(why, whysize, "no bitcode for %s", fname); return 0; }
+    FunctionConstants consts;
+    for (unsigned i = 0; i < nfc; i++) consts.push_back({fc[i].index, fc[i].bits});
+    std::vector<uint8_t> m;
     std::string w;
-    auto v = stage_of(lv, vname, MetalFunction::kVertex, &w);
+    if (!knownBufferControlBytes(bc, n, consts, binding, length, &m, &w)) { snprintf(why, whysize, "%s", w.c_str()); return 0; }
+    memset(mask, 0, length);
+    memcpy(mask, m.data(), m.size() < length ? m.size() : length);
+    return 1;
+}
+
+static int compile_program(struct lavcc_lib* lv, const char* vname, const struct lavcc_const* vc, unsigned nvc,
+                           struct lavcc_lib* lf, const char* fname, const struct lavcc_const* fc, unsigned nfc, const KnownBuffer* known,
+                           struct lav5_stage* vs, struct lav5_stage* fs, struct lav5_link* link, char* why, size_t whysize)
+{
+    std::string w;
+    FunctionConstants vconsts, fconsts;
+    for (unsigned i = 0; i < nvc; i++) vconsts.push_back({vc[i].index, vc[i].bits});
+    for (unsigned i = 0; i < nfc; i++) fconsts.push_back({fc[i].index, fc[i].bits});
+    auto v = stage_of(lv, vname, MetalFunction::kVertex, &w, vconsts);
     if (!v) { snprintf(why, whysize, "vertex function: %s", w.c_str()); return 0; }
-    auto f = stage_of(lf, fname, MetalFunction::kFragment, &w);
+    auto f = stage_of(lf, fname, MetalFunction::kFragment, &w, fconsts, known);
     if (!f) { snprintf(why, whysize, "fragment function: %s", w.c_str()); return 0; }
     Linkage lk{};
     if (!render::link(v->stage, f->stage, &lk, &w)) { snprintf(why, whysize, "link: %s", w.c_str()); return 0; }
@@ -218,6 +281,17 @@ extern "C" int lavcc_compile_program(struct lavcc_lib* lv, const char* vname, st
     memset(link, 0, sizeof *link);
     flatten_stage(v->stage, v->resources, vs);
     flatten_stage(f->stage, f->resources, fs);
+    if (const char* dir = access("/var/tmp/lavlist", F_OK) == 0 ? "/var/tmp/lst" : nullptr) {
+        mkdir(dir, 0777);
+        // the ir3 disassembly of the fragment stage, for the eye (one file per compile)
+        static unsigned seq;
+        char path[300];
+        snprintf(path, sizeof path, "%s/fs-%s-%s-%u.txt", dir, fname, known ? "known" : "plain", seq++);
+        if (FILE* fp = fopen(path, "w")) {
+            fwrite(f->listing.data(), 1, f->listing.size(), fp);
+            fclose(fp);
+        }
+    }
     link->cnt = lk.cnt;
     link->max_loc = lk.maxLoc;
     link->position_loc = lk.positionLoc;
@@ -231,6 +305,51 @@ extern "C" int lavcc_compile_program(struct lavcc_lib* lv, const char* vname, st
         link->var[i].loc = lk.var[i].loc;
     }
     return 1;
+}
+
+// the names of a function's constants: air.function_constants holds one node each, strings (the name among them) then the index
+extern "C" unsigned lavcc_function_constants(struct lavcc_lib* l, const char* fname, struct lavcc_fcname* out, unsigned max)
+{
+    const MetalFunction* fn = l->lib.find(fname);
+    const uint8_t* bc = nullptr;
+    uint64_t bcSize = 0;
+    unsigned num = 0;
+    if (!fn || !l->lib.bitcode(*fn, &bc, &bcSize)) return 0;
+    void* ctx = ralloc_context(nullptr);
+    const char* err = nullptr;
+    struct air_module* m = air_module_read(ctx, bc, bcSize, &err);
+    if (m) {
+        for (unsigned i = 0; i < m->num_named_md; i++) {
+            if (strcmp(m->named_md[i].name, "air.function_constants") != 0) continue;
+            for (unsigned j = 0; j < m->named_md[i].num_ops && num < max; j++) {
+                const struct air_md* node = m->named_md[i].ops[j];
+                if (!node || node->kind != AIR_MD_NODE) continue;
+                const char* names[4];
+                unsigned nn = 0;
+                for (unsigned k = 0; k < node->num_ops; k++) {
+                    const struct air_md* op = node->ops[k];
+                    if (!op) continue;
+                    if (op->kind == AIR_MD_STRING) {
+                        const char* s = air_md_string(op);
+                        if (s && nn < 4) names[nn++] = s;
+                        continue;
+                    }
+                    uint64_t idx;
+                    if (op->kind == AIR_MD_VALUE && air_const_uint(op->value, &idx)) {
+                        // every string of the node answers to the index: the constant's name is one of them
+                        for (unsigned q = 0; q < nn && num < max; q++) {
+                            snprintf(out[num].name, sizeof out[num].name, "%s", names[q]);
+                            out[num].index = uint32_t(idx);
+                            num++;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    ralloc_free(ctx);
+    return num;
 }
 
 extern "C" void lavcc_stage_free(struct lav5_stage* s) { lavcc_kernel_free(&s->k); }

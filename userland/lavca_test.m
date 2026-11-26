@@ -53,7 +53,7 @@ near(const uint8_t * px, int b, int g, int r)
 }
 
 int
-main(void)
+main(int argc, char ** argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	@autoreleasepool {
@@ -71,16 +71,18 @@ main(void)
 		signal(SIGTRAP, crashed);
 		IOConnectCallStructMethod(conn, kLavMetal, &on, sizeof(on), NULL, NULL);
 
+		unsigned W = argc > 1 ? (unsigned)atoi(argv[1]) : 256, H = argc > 2 ? (unsigned)atoi(argv[2]) : 256;
 		id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
 		if (dev == nil) {
 			printf("MTLCreateSystemDefaultDevice: nil\nFAILED\n");
 			return 1;
 		}
 		MTLTextureDescriptor * td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-		    width:256 height:256 mipmapped:NO];
+		    width:W height:H mipmapped:NO];
 		td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
 		id<MTLTexture> tex = [dev newTextureWithDescriptor:td];
-		check("render target texture 256x256", tex != nil);
+		printf("target %ux%u\n", W, H);
+		check("render target texture", tex != nil);
 
 		CARenderer * r = [CARenderer rendererWithMTLTexture:tex options:nil];
 		check("CARenderer made", r != nil);
@@ -89,7 +91,7 @@ main(void)
 			return 1;
 		}
 		CALayer * root = [CALayer layer];
-		root.frame = CGRectMake(0, 0, 256, 256);
+		root.frame = CGRectMake(0, 0, W, H);
 		root.backgroundColor = CGColorCreateGenericRGB(1, 0, 0, 1);
 		CALayer * g = [CALayer layer];
 		g.frame = CGRectMake(32, 32, 64, 64);
@@ -100,7 +102,7 @@ main(void)
 		b.backgroundColor = CGColorCreateGenericRGB(0, 0, 1, 1);
 		[root addSublayer:b];
 		r.layer = root;
-		r.bounds = CGRectMake(0, 0, 256, 256);
+		r.bounds = CGRectMake(0, 0, W, H);
 
 		[CATransaction flush];
 		[r beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];
@@ -108,12 +110,12 @@ main(void)
 		[r render];
 		[r endFrame];
 
-		uint8_t px[256 * 256 * 4];
-		[tex getBytes:px bytesPerRow:256 * 4 fromRegion:MTLRegionMake2D(0, 0, 256, 256) mipmapLevel:0];
+		uint8_t * px = malloc((size_t)W * H * 4);
+		[tex getBytes:px bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
 		/* CALayer's y axis may be flipped by the renderer: accept either orientation for the two children */
-		const uint8_t * bg = px + (8 * 256 + 8) * 4;
-		const uint8_t * c1 = px + (64 * 256 + 64) * 4, * c1f = px + (192 * 256 + 64) * 4;
-		const uint8_t * c2 = px + (192 * 256 + 192) * 4, * c2f = px + (64 * 256 + 192) * 4;
+		const uint8_t * bg = px + ((size_t)8 * W + 8) * 4;
+		const uint8_t * c1 = px + ((size_t)64 * W + 64) * 4, * c1f = px + ((size_t)(H - 64) * W + 64) * 4;
+		const uint8_t * c2 = px + ((size_t)192 * W + 192) * 4, * c2f = px + ((size_t)(H - 192) * W + 192) * 4;
 
 		printf("pixels: bg %02x%02x%02x  g %02x%02x%02x/%02x%02x%02x  b %02x%02x%02x/%02x%02x%02x\n", bg[2], bg[1], bg[0],
 		    c1[2], c1[1], c1[0], c1f[2], c1f[1], c1f[0], c2[2], c2[1], c2[0], c2f[2], c2f[1], c2f[0]);
