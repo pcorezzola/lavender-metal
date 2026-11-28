@@ -85,6 +85,7 @@ struct texstate {
 	uint32_t * segLen;
 	uint32_t nseg, segsTried;
 	uint32_t segsLogged;                    /* the physical runs of the surface were listed once (debug) */
+	unsigned copiedGen;                     /* the commit that last copied the IOSurface into this texture (a draw samples it many times, one copy is enough) */
 	uint32_t synced;                        /* the texture memory equals the surface (written back whole once): a Load need not read the slow surface again */
 };
 
@@ -180,6 +181,31 @@ deviceNewTexture(__unused id self, __unused SEL _cmd, id desc)
 	return o;
 }
 
+struct surface_pixel_sample {
+	uint32_t signature;
+	unsigned nonblack;
+	unsigned alpha;
+};
+
+static struct surface_pixel_sample
+surfacePixelSample(const uint8_t *base, size_t pitch, size_t width, size_t height)
+{
+	struct surface_pixel_sample sample = { .signature = 2166136261u };
+
+	for (size_t y = 1; y <= 13; y++) {
+		const uint8_t *row = base + (height * y / 14) * pitch;
+
+		for (size_t x = 1; x <= 9; x++) {
+			uint32_t pixel;
+			memcpy(&pixel, row + (width * x / 10) * sizeof(pixel), sizeof(pixel));
+			sample.signature = (sample.signature ^ pixel) * 16777619u;
+			sample.nonblack += (pixel & 0x00ffffffu) != 0;
+			sample.alpha += (pixel >> 24) != 0;
+		}
+	}
+	return sample;
+}
+
 /* IOSurface <-> the texture's own memory (the GPU cannot reach an IOSurface's scattered pages): rows copied at the edges */
 static void
 surfaceCopyRows(struct texstate * t, BOOL toSurface, size_t ya, size_t yb, BOOL profile)
@@ -204,6 +230,17 @@ surfaceCopyRows(struct texstate * t, BOOL toSurface, size_t ya, size_t yb, BOOL 
 	if (yb > rows) {
 		yb = rows;
 	}
+	static unsigned pixelTraces;
+	BOOL tracePixels = pixelTraces < 24 && toSurface && t->bpp == 4 &&
+	    t->width == 1080 && rows == 2340 && ya == 0 && yb == rows &&
+	    base != NULL && t->b.cpu != NULL && sp >= row && t->pitch >= row &&
+	    access("/var/tmp/lavpixeltrace", F_OK) == 0;
+	struct surface_pixel_sample source = {};
+
+	if (tracePixels) {
+		source = surfacePixelSample(t->b.cpu, t->pitch, t->width, rows);
+		pixelTraces++;
+	}
 	if (toSurface && !t->segsLogged && sp * rows >= (1u << 20)) {
 		/* debugging: how many physically contiguous runs make up this surface (could the GPU render into it directly?) */
 		uint64_t in[2] = { (uint64_t)(uintptr_t)base, (uint64_t)sp * rows }, out[3 + 2 * 24];
@@ -220,8 +257,8 @@ surfaceCopyRows(struct texstate * t, BOOL toSurface, size_t ya, size_t yb, BOOL 
 		}
 	}
 	{
-		/* the surface is slow memory and one core only gets ~150 MB/s out of it: four slices at once */
-		size_t n = yb > ya ? yb - ya : 0, nsl = n >= 64 ? 4 : 1;
+		/* sequential memcpy on one thread avoids waking 4 GCD workers and WC bus contention on id 1 */
+		size_t n = yb > ya ? yb - ya : 0, nsl = 1;
 		uint8_t * cpu = (uint8_t *)t->b.cpu;
 		size_t pitch = t->pitch;
 
@@ -284,6 +321,14 @@ surfaceCopyRows(struct texstate * t, BOOL toSurface, size_t ya, size_t yb, BOOL 
 				lavlog("surface dumped to /var/tmp/lavsurf.bgra (%ux%zu)", t->width, rows);
 			}
 		}
+	}
+	if (tracePixels) {
+		struct surface_pixel_sample target = surfacePixelSample(base, sp, t->width, rows);
+
+		lavlog("surface pixels: id %u format %u source RGB %u alpha %u hash %08x destination RGB %u alpha %u hash %08x",
+		    (unsigned)IOSurfaceGetID(t->surface), t->format,
+		    source.nonblack, source.alpha, source.signature,
+		    target.nonblack, target.alpha, target.signature);
 	}
 	if (profile) {
 		unlockStart = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -1005,8 +1050,9 @@ deviceNewTextureSurface(id self, SEL cmd, id desc, IOSurfaceRef surface, uint64_
 		return nil;
 	}
 	st->surface = (IOSurfaceRef)CFRetain(surface);
-	lavlog("texture over an IOSurface %zux%zu, row %zu bytes", IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
-	    IOSurfaceGetBytesPerRow(surface));
+	lavlog("texture over an IOSurface id %u %zux%zu, row %zu bytes, pixel format %#x",
+	    (unsigned)IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
+	    IOSurfaceGetBytesPerRow(surface), IOSurfaceGetPixelFormat(surface));
 	return o;
 }
 
@@ -1236,7 +1282,7 @@ static void
 pipeCachePath(struct fnstate * vs, struct fnstate * fs, char * path, size_t n)
 {
 	uint64_t h = 0xcbf29ce484222325ull;
-	const char * stamp = __DATE__ __TIME__;
+	const char * stamp = "lavcache-v1";
 
 	h = lavHash64(h, stamp, strlen(stamp));
 	h = lavHash64(h, &STATE(vs->library, struct libstate)->hash, 8);
@@ -1381,7 +1427,7 @@ static uint64_t
 ctlKey(struct fnstate * ff, int buf, uint32_t len)
 {
 	uint64_t h = 0xcbf29ce484222325ull;
-	const char * stamp = __DATE__ __TIME__;
+	const char * stamp = "lavcache-v1";
 
 	h = lavHash64(h, stamp, strlen(stamp));
 	h = lavHash64(h, &STATE(ff->library, struct libstate)->hash, 8);
@@ -1474,7 +1520,7 @@ static void
 specCachePath(struct fnstate * vf, struct fnstate * ff, int fbind, uint64_t key, char * path, size_t n)
 {
 	uint64_t h = 0xcbf29ce484222325ull;
-	const char * stamp = __DATE__ __TIME__;
+	const char * stamp = "lavcache-v1";
 
 	h = lavHash64(h, stamp, strlen(stamp));
 	h = lavHash64(h, &STATE(vf->library, struct libstate)->hash, 8);
@@ -2329,6 +2375,15 @@ runClear(struct op * op)
 	struct texstate * t = STATE(op->dst, struct texstate);
 	uint32_t r = clamp8(op->clear[0]), g = clamp8(op->clear[1]), b = clamp8(op->clear[2]), a = clamp8(op->clear[3]);
 	uint32_t px = t->format == PF_BGRA8 ? (b | g << 8 | r << 16 | a << 24) : (r | g << 8 | b << 16 | a << 24);
+	static unsigned clearTraces;
+
+	if (clearTraces < 12 && t->width == 1080 && t->height == 2340 &&
+	    access("/var/tmp/lavpixeltrace", F_OK) == 0) {
+		clearTraces++;
+		lavlog("surface operation: clear id %u gpu %llx format %u value %08x",
+		    t->surface != NULL ? (unsigned)IOSurfaceGetID(t->surface) : 0,
+		    (unsigned long long)t->b.gpu, t->format, px);
+	}
 
 	if (!pfIsDraw(t->format)) {
 		memset(t->b.cpu, 0, (size_t)t->pitch * t->height);     /* a clear of a format not drawn into: zero */
@@ -2398,7 +2453,7 @@ runDraw(struct op * op)
 	struct lav5_render * r = calloc(1, sizeof(*r));
 	uint32_t * w;
 	const char * why = NULL;
-	size_t n, boff = 0;
+	size_t n, boff;
 	BOOL ok;
 	const char * name = rp->vs.k.name[0] ? rp->vs.k.name : "(render)";
 
@@ -2427,6 +2482,11 @@ runDraw(struct op * op)
 		free(r);
 		return NO;
 	}
+	if (gBytesUsed + 16384 > gBytes.len && !lavFlush()) {
+		free(r);
+		return NO;
+	}
+	boff = gBytesUsed;
 	uint64_t tp0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 	const struct rspec * sp = rpipeSpecialise(rp, d);
 	const struct lav5_stage * vsx = sp != NULL ? &sp->vs : &rp->vs, * fsx = sp != NULL ? &sp->fs : &rp->fs;
@@ -2472,6 +2532,7 @@ runDraw(struct op * op)
 		free(r);
 		return NO;
 	}
+	gBytesUsed = (boff + 15) & ~(size_t)15;
 	r->prim = d->prim;
 	r->first = d->first;
 	r->count = d->count;
@@ -2535,10 +2596,15 @@ runDraw(struct op * op)
 
 			const struct pfmt * pf = pfmtOf(ts->format);
 
-			if (ts->surface != NULL && ts != t && (size_t)ts->height * ts->pitch <= (1u << 20)) {
+			if (ts->surface != NULL && ts != t && (size_t)ts->height * ts->pitch <= (1u << 20) && (ts->copiedGen != gCommitGen || gNoBatch)) {
 				/* a texture over an IOSurface that is only sampled (a glyph atlas): its pixels live in the surface, bring them in */
 				uint64_t tc0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 
+				if (!lavFlush()) {
+					free(r);
+					return NO;
+				}
+				ts->copiedGen = gCommitGen;
 				surfaceCopy(ts, NO);
 				gTCopy += clock_gettime_nsec_np(CLOCK_MONOTONIC) - tc0;
 			}
@@ -2555,6 +2621,10 @@ runDraw(struct op * op)
 	/* CoreAnimation clears an attachment with a draw of attachment_clear_frag (it returns zero for every target). On the 1080x2340
 	 * targets that draw hung the SoC, so it is done here as a fill with zero of the scissor rectangle of each target written */
 	if (strncmp([STATE(rp->ffn, struct fnstate)->name UTF8String], "attachment_clear_frag", 21) == 0) {
+		if (!lavFlush()) {
+			free(r);
+			return NO;
+		}
 		uint32_t sx = d->scissor[0], sy = d->scissor[1], sw = d->scissor[2], sh = d->scissor[3];
 
 		for (int i = 0; i < 8; i++) {
@@ -2578,14 +2648,13 @@ runDraw(struct op * op)
 		free(r);
 		return YES;
 	}
-	/* a draw over many rows goes in bands of BAND rows, one submit each: a full-screen draw on the 1080x2340 target hung the whole SoC
-	 * (the GPU stalls the bus), while the same draw on a smaller scissor completes */
-	uint32_t bandY = r->scissor[1], bandH = r->scissor[3], bandStep = bandH;
+	/* a draw over many rows goes in bands of BAND rows, batched into one submit: a full-screen draw on the 1080x2340 target hung the
+	 * whole SoC (the GPU stalls the bus), while the same draw split into smaller scissor bands completes */
+	uint32_t bandH = r->scissor[3];
 	if (bandH > LAV_BAND_ROWS) {
-		bandStep = LAV_BAND_ROWS;
-		r->scissor[3] = bandStep;
+		r->band_step = LAV_BAND_ROWS;
 		if (gDrawTrace) {
-			lavlog("draw: %u rows submitted in bands of %u", bandH, bandStep);
+			lavlog("draw: %u rows batched in bands of %u", bandH, LAV_BAND_ROWS);
 		}
 	}
 	tp0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -2712,17 +2781,53 @@ runDraw(struct op * op)
 	if (gDrawTrace && t->width == 1080 && t->height == 2340) {
 		camBefore = *(volatile uint32_t *)((uint8_t *)t->b.cpu + (size_t)2115 * t->pitch + 867 * 4);
 	}
-	tp0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-	ok = lavSubmit(w, n);
-	gNSub++;
-	for (uint32_t off = bandStep; ok && off < bandH; off += bandStep) {
-		r->scissor[1] = bandY + off;
-		r->scissor[3] = bandH - off < bandStep ? bandH - off : bandStep;
-		n = lav5_build_render(w, STREAM_WORDS, r, &why);
-		ok = n != 0 && lavSubmit(w, n);
-		gNSub++;
+	static unsigned tracedDraws;
+	unsigned drawNumber = 0;
+	struct surface_pixel_sample before = {};
+
+	if (tracedDraws < 24 && t->bpp == 4 && t->width == 1080 && t->height == 2340 &&
+	    access("/var/tmp/lavpixeltrace", F_OK) == 0) {
+		drawNumber = ++tracedDraws;
+		before = surfacePixelSample(t->b.cpu, t->pitch, t->width, t->height);
+		texCpuDoneRows(t, 0, t->height);
+		lavlog("surface operation: draw %u id %u gpu %llx %s + %s vertices %u targets %u mask %x scissor %u,%u %ux%u before RGB %u alpha %u hash %08x",
+		    drawNumber, t->surface != NULL ? (unsigned)IOSurfaceGetID(t->surface) : 0, (unsigned long long)t->b.gpu,
+		    [STATE(rp->vfn, struct fnstate)->name UTF8String], [STATE(rp->ffn, struct fnstate)->name UTF8String],
+		    d->count, r->nrt, r->blend.writemask, d->scissor[0], d->scissor[1],
+		    d->scissor[2], d->scissor[3], before.nonblack, before.alpha, before.signature);
+		for (unsigned i = 0; i < sizeof(d->ftex) / sizeof(d->ftex[0]); i++) {
+			if (d->ftex[i] == nil) {
+				continue;
+			}
+			struct texstate *input = STATE(d->ftex[i], struct texstate);
+			unsigned sid = input->surface != NULL ? (unsigned)IOSurfaceGetID(input->surface) : 0;
+
+			if (input->bpp == 4 && input->b.cpu != NULL) {
+				struct surface_pixel_sample sample = surfacePixelSample(input->b.cpu, input->pitch,
+				    input->width, input->height);
+
+				texCpuDoneRows(input, 0, input->height);
+				lavlog("surface operation: draw %u input %u id %u gpu %llx %ux%u fmt %u RGB %u alpha %u hash %08x",
+				    drawNumber, i, sid, (unsigned long long)input->b.gpu, input->width, input->height,
+				    input->format, sample.nonblack, sample.alpha, sample.signature);
+			} else {
+				lavlog("surface operation: draw %u input %u id %u gpu %llx %ux%u fmt %u",
+				    drawNumber, i, sid, (unsigned long long)input->b.gpu,
+				    input->width, input->height, input->format);
+			}
+		}
 	}
+	tp0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+	ok = (gDrawTrace || drawNumber != 0 || access("/var/tmp/lavprof", F_OK) == 0) ? lavSubmit(w, n) : lavQueue(w, n);
+	gNSub++;
 	gTSubmit += clock_gettime_nsec_np(CLOCK_MONOTONIC) - tp0;
+	if (drawNumber != 0 && ok) {
+		struct surface_pixel_sample after = surfacePixelSample(t->b.cpu, t->pitch, t->width, t->height);
+
+		texCpuDoneRows(t, 0, t->height);
+		lavlog("surface operation: draw %u result RGB %u alpha %u hash %08x",
+		    drawNumber, after.nonblack, after.alpha, after.signature);
+	}
 	gPixels += (uint64_t)bandH * d->scissor[2];
 	if (access("/var/tmp/lavprof", F_OK) == 0) {
 		uint64_t ns = clock_gettime_nsec_np(CLOCK_MONOTONIC) - tp0, px = (uint64_t)bandH * d->scissor[2];

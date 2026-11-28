@@ -11,6 +11,7 @@
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <QuartzCore/QuartzCore.h>
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
@@ -80,8 +81,23 @@ main(int argc, char ** argv)
 		MTLTextureDescriptor * td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 		    width:W height:H mipmapped:NO];
 		td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-		id<MTLTexture> tex = [dev newTextureWithDescriptor:td];
-		printf("target %ux%u\n", W, H);
+		BOOL useSurface = argc > 3 && strcmp(argv[3], "iosurface") == 0;
+		IOSurfaceRef surface = NULL;
+		id<MTLTexture> tex;
+		if (useSurface) {
+			size_t stride = ((size_t)W * 4 + 63) & ~(size_t)63;
+			NSDictionary *properties = @{
+			    (__bridge NSString *)kIOSurfaceWidth: @(W), (__bridge NSString *)kIOSurfaceHeight: @(H),
+			    (__bridge NSString *)kIOSurfaceBytesPerRow: @(stride),
+			    (__bridge NSString *)kIOSurfaceBytesPerElement: @4,
+			    (__bridge NSString *)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+			};
+			surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+			tex = surface != NULL ? [dev newTextureWithDescriptor:td iosurface:surface plane:0] : nil;
+		} else {
+			tex = [dev newTextureWithDescriptor:td];
+		}
+		printf("target %ux%u %s\n", W, H, useSurface ? "IOSurface" : "private texture");
 		check("render target texture", tex != nil);
 
 		CARenderer * r = [CARenderer rendererWithMTLTexture:tex options:nil];
@@ -123,6 +139,22 @@ main(int argc, char ** argv)
 		check("green child is where it was put", near(c1, 0, 255, 0) || near(c1f, 0, 255, 0));
 		check("blue child is where it was put", near(c2, 255, 0, 0) || near(c2f, 255, 0, 0));
 
+		if (surface != NULL) {
+			BOOL same = IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) == 0;
+
+			if (same) {
+				const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+				size_t stride = IOSurfaceGetBytesPerRow(surface);
+
+				for (unsigned y = 0; same && y < H; y++) {
+					same = memcmp(base + (size_t)y * stride, px + (size_t)y * W * 4, (size_t)W * 4) == 0;
+				}
+				IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+			}
+			check("IOSurface pixels match the rendered texture", same);
+			CFRelease(surface);
+		}
+		free(px);
 		on = 0;
 		IOConnectCallStructMethod(conn, kLavMetal, &on, sizeof(on), NULL, NULL);
 		printf("%s\n", gFailed == 0 ? "PASSED" : "FAILED");

@@ -89,6 +89,8 @@ static struct lbuf gStream;         /* [0, 16 KB): the PM4 words of a submission
 static pthread_mutex_t gGPULock = PTHREAD_MUTEX_INITIALIZER;
 
 #define STREAM_WORDS    4096u
+static void lavProbeBatch(void);
+#define BATCH_WORDS     8192u       /* the words of the queued draws: they go out as one stream, [0, 32 KB) of gStream */
 #define LAV_BAND_ROWS   400u        /* rows of a draw per submit */
 #define SCRATCH_OFFSET  0x8000u
 
@@ -270,18 +272,24 @@ lavOpen(void)
 	static dispatch_once_t once;
 
 	dispatch_once(&once, ^{
-		io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("LavenderGPU"));
-		kern_return_t kr;
+		static const char * const names[] = { "LavenderGPU", "IOAcceleratorES" };
+		kern_return_t kr = kIOReturnNotFound;
 
-		if (service == 0) {
-			lavlog("no LavenderGPU service");
-			return;
+		for (unsigned i = 0; i < 2 && gConn == 0; i++) {
+			io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(names[i]));
+
+			if (service == 0) {
+				continue;
+			}
+			kr = IOServiceOpen(service, mach_task_self(), 0, &gConn);
+			IOObjectRelease(service);
+			if (kr != KERN_SUCCESS) {
+				lavlog("IOServiceOpen(%s): kr %#x", names[i], kr);
+				gConn = 0;
+			}
 		}
-		kr = IOServiceOpen(service, mach_task_self(), 0, &gConn);
-		IOObjectRelease(service);
-		if (kr != KERN_SUCCESS) {
-			lavlog("IOServiceOpen: kr %#x", kr);
-			gConn = 0;
+		if (gConn == 0) {
+			lavlog("no GPU service (last kr %#x)", kr);
 			return;
 		}
 		if (!lavBufNewDirect(65536, &gStream)) {
@@ -289,20 +297,21 @@ lavOpen(void)
 			return;
 		}
 		lavlog("the GPU service is open; stream buffer at GPU %#llx", (unsigned long long)gStream.gpu);
+		lavProbeBatch();
 	});
 	return gConn != 0 && gStream.handle != 0;
 }
 
 /* One synchronous submission: the words go into the stream buffer and the service reads them from there. */
 static BOOL
-lavSubmit(const uint32_t * words, size_t count)
+lavSubmitNow(const uint32_t * words, size_t count)
 {
 	struct lav_submit_buf sb = { gStream.handle, 0, (uint32_t)count, 0 };
 	struct lav_submit_out out = { 0, 0 };
 	size_t outsize = sizeof(out);
 	kern_return_t kr;
 
-	if (count == 0 || count > STREAM_WORDS) {
+	if (count == 0 || count > BATCH_WORDS) {
 		return NO;
 	}
 	memcpy(gStream.cpu, words, count * 4);
@@ -322,6 +331,61 @@ lavSubmit(const uint32_t * words, size_t count)
 	return YES;
 }
 
+/*
+ * Batching: a draw's stream is ~1000 words and every submit costs ~2 ms of fixed work in the service (fence, cache
+ * invalidate, wait), so the draws of a command buffer are queued here and go to the GPU as one stream. Whatever needs the
+ * GPU's result or touches memory the GPU uses (any op but a draw, the surface sync, a CPU copy into a texture) calls
+ * lavFlush() first; lavSubmit() flushes by itself so the order is kept. gBytesUsed is how much of gBytes (setBytes data
+ * the queued draws read) is taken: it starts again at 0 after a flush. /var/tmp/lavnobatch turns it off.
+ */
+static size_t gBatchMax = 4096;              /* words per submit the kernel takes: 4096 before patch 0367, BATCH_WORDS after (probed at open) */
+static uint32_t gPend[BATCH_WORDS];
+static size_t gPendN;
+static size_t gBytesUsed;
+static unsigned gCommitGen = 1;
+static int gNoBatch;
+
+static BOOL
+lavFlush(void)
+{
+	size_t n = gPendN;
+
+	gPendN = 0;
+	gBytesUsed = 0;
+	if (n == 0) {
+		return YES;
+	}
+	return lavSubmitNow(gPend, n);
+}
+
+static BOOL
+lavSubmit(const uint32_t * words, size_t count)
+{
+	if (!lavFlush()) {
+		return NO;
+	}
+	return lavSubmitNow(words, count);
+}
+
+static BOOL
+lavQueue(const uint32_t * words, size_t count)
+{
+	if (gNoBatch || gBatchMax <= 4096 || count > gBatchMax / 2) {
+		return lavSubmit(words, count);
+	}
+	if (gPendN + count > gBatchMax) {
+		size_t keep = gBytesUsed;
+
+		if (!lavFlush()) {
+			return NO;
+		}
+		gBytesUsed = keep;                          /* the draw being queued has its setBytes data in place already */
+	}
+	memcpy(gPend + gPendN, words, count * 4);
+	gPendN += count;
+	return YES;
+}
+
 /* ------------------------------------------------------------------------------------------------------------------ */
 /* PM4 streams                                                                                                         */
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -333,6 +397,20 @@ parity(uint32_t v)
 	v ^= v >> 8;
 	v ^= v >> 4;
 	return (0x9669u >> (v & 0xf)) & 1u;
+}
+
+/* A harmless stream of CP_NOPs longer than the old kernel limit: if the service takes it, draws can be batched. */
+static void
+lavProbeBatch(void)
+{
+	static uint32_t nop[4100];
+	uint32_t cnt = 4099, op = 0x10;
+
+	nop[0] = 0x70000000u | cnt | (parity(cnt) << 15) | (op << 16) | (parity(op) << 23);
+	if (lavSubmitNow(nop, 4100)) {
+		gBatchMax = BATCH_WORDS;
+	}
+	lavlog("batching: the service takes streams of %zu words%s", gBatchMax, gBatchMax > 4096 ? " (draws are queued and sent together)" : " (old kernel: one submit per draw)");
 }
 
 struct stream {
@@ -1275,15 +1353,28 @@ deviceNewLibrarySource(__unused id self, __unused SEL _cmd, __unused id source, 
 }
 
 static id
-deviceNoLibrary(__unused id self, __unused SEL _cmd)
+deviceNoLibrary(id self, SEL _cmd)
 {
+	NSBundle * b = [NSBundle mainBundle];
+	NSString * path = b != nil ? [b pathForResource:@"default" ofType:@"metallib"] : nil;
+
+	if (path != nil) {
+		return deviceNewLibraryFile(self, _cmd, path, NULL);
+	}
 	lavlog("newDefaultLibrary: no default library");
 	return nil;
 }
 
 static id
-deviceNoLibraryBundle(__unused id self, __unused SEL _cmd, __unused id bundle, NSError ** err)
+deviceNoLibraryBundle(id self, SEL _cmd, id bundle, NSError ** err)
 {
+	NSString * path = [bundle isKindOfClass:[NSBundle class]]
+	    ? [(NSBundle *)bundle pathForResource:@"default" ofType:@"metallib"]
+	    : nil;
+
+	if (path != nil) {
+		return deviceNewLibraryFile(self, _cmd, path, err);
+	}
 	lavlog("newDefaultLibraryWithBundle: no default library");
 	lavError(err, @"MTLLibraryErrorDomain", "no default library");
 	return nil;
@@ -2163,9 +2254,14 @@ cbCommit(id self, __unused SEL _cmd)
 	gCommitStage = 0;
 	gCommitDumped = 0;
 	gCommitBusy = 1;
+	gCommitGen++;
+	gNoBatch = access("/var/tmp/lavnobatch", F_OK) == 0;
 	gTSpec = gTCopy = gTBuild = gTSubmit = gNSub = gPixels = 0;
-	lavlog("commit: %zu ops, %lu drawables, %lu scheduled, %lu completed handlers", st->nops, (unsigned long)[st->drawables count],
-	    (unsigned long)[st->scheduled count], (unsigned long)[st->handlers count]);
+	BOOL prof = access("/var/tmp/lavprof", F_OK) == 0;
+	if (prof) {
+		lavlog("commit: %zu ops, %lu drawables, %lu scheduled, %lu completed handlers", st->nops, (unsigned long)[st->drawables count],
+		    (unsigned long)[st->scheduled count], (unsigned long)[st->handlers count]);
+	}
 	for (id h in st->scheduled) {
 		((LavHandler)h)(self);
 	}
@@ -2185,6 +2281,10 @@ cbCommit(id self, __unused SEL _cmd)
 		tPrev = to;
 		tLast = (unsigned)st->ops[i].kind;
 		gCommitStage = (int)(i * 100) + (int)st->ops[i].kind;
+		if (st->ops[i].kind != OP_DRAW && !lavFlush()) {
+			ok = NO;
+			break;
+		}
 		switch (st->ops[i].kind) {
 		case OP_FILL:
 			ok = runFill(&st->ops[i]);
@@ -2217,6 +2317,9 @@ cbCommit(id self, __unused SEL _cmd)
 		tPrev = to;
 	}
 	gCommitStage = -1;                      /* syncing surfaces */
+	if (!lavFlush()) {
+		ok = NO;
+	}
 	if (ok) {
 		cbSyncSurfaces(st);
 	}
@@ -2232,19 +2335,23 @@ cbCommit(id self, __unused SEL _cmd)
 	[st->drawables removeAllObjects];
 	st->status = ok ? 4 : 5;                /* Completed or Error */
 	gCommitBusy = 0;
-	lavlog("commit: %s, running %lu completed handlers", ok ? "completed" : "ERROR", (unsigned long)[st->handlers count]);
-	lavlog("draw phases (ms): specialise %llu, texture copy-in %llu, build stream %llu, submit+wait %llu in %llu submits, %llu kpixels",
-	    (unsigned long long)(gTSpec / 1000000u), (unsigned long long)(gTCopy / 1000000u), (unsigned long long)(gTBuild / 1000000u),
-	    (unsigned long long)(gTSubmit / 1000000u), (unsigned long long)gNSub, (unsigned long long)(gPixels / 1000u));
-	lavlog("commit time: total %llu ms; by op kind (ms) 0:%llu 1:%llu 2:%llu 3:%llu 4:%llu 5:%llu 6:%llu 7+:%llu; sync %llu ms; slowest op kind %u %llu ms",
-	    (unsigned long long)((clock_gettime_nsec_np(CLOCK_MONOTONIC) - tStart) / 1000000u), (unsigned long long)(tKind[0] / 1000000u),
-	    (unsigned long long)(tKind[1] / 1000000u), (unsigned long long)(tKind[2] / 1000000u), (unsigned long long)(tKind[3] / 1000000u),
-	    (unsigned long long)(tKind[4] / 1000000u), (unsigned long long)(tKind[5] / 1000000u), (unsigned long long)(tKind[6] / 1000000u),
-	    (unsigned long long)(tKind[7] / 1000000u), (unsigned long long)(tSync / 1000000u), tMaxKind, (unsigned long long)(tMax / 1000000u));
+	if (!ok || prof) {
+		lavlog("commit: %s, running %lu completed handlers", ok ? "completed" : "ERROR", (unsigned long)[st->handlers count]);
+		lavlog("draw phases (ms): specialise %llu, texture copy-in %llu, build stream %llu, submit+wait %llu in %llu submits, %llu kpixels",
+		    (unsigned long long)(gTSpec / 1000000u), (unsigned long long)(gTCopy / 1000000u), (unsigned long long)(gTBuild / 1000000u),
+		    (unsigned long long)(gTSubmit / 1000000u), (unsigned long long)gNSub, (unsigned long long)(gPixels / 1000u));
+		lavlog("commit time: total %llu ms; by op kind (ms) 0:%llu 1:%llu 2:%llu 3:%llu 4:%llu 5:%llu 6:%llu 7+:%llu; sync %llu ms; slowest op kind %u %llu ms",
+		    (unsigned long long)((clock_gettime_nsec_np(CLOCK_MONOTONIC) - tStart) / 1000000u), (unsigned long long)(tKind[0] / 1000000u),
+		    (unsigned long long)(tKind[1] / 1000000u), (unsigned long long)(tKind[2] / 1000000u), (unsigned long long)(tKind[3] / 1000000u),
+		    (unsigned long long)(tKind[4] / 1000000u), (unsigned long long)(tKind[5] / 1000000u), (unsigned long long)(tKind[6] / 1000000u),
+		    (unsigned long long)(tKind[7] / 1000000u), (unsigned long long)(tSync / 1000000u), tMaxKind, (unsigned long long)(tMax / 1000000u));
+	}
 	for (id h in st->handlers) {
 		((LavHandler)h)(self);
 	}
-	lavlog("commit: handlers returned");
+	if (prof) {
+		lavlog("commit: handlers returned");
+	}
 }
 
 static void

@@ -176,6 +176,7 @@ struct lav5_render {
 	uint32_t nrt;                               /* colour targets of the pass; 0: just the rt_* one. rt[0] is then rt_*, rt[1..] the others */
 	struct lav5_rt rt[8];
 	struct lav5_blend blend_x[8];               /* blend of targets 1.. ([0] is `blend`) */
+	uint32_t band_step;                         /* 0: single draw; >0: split scissor[3] into bands of band_step rows in one stream */
 };
 
 /* the stream of one draw into one colour target, in sysmem (bypass) mode; 0 with *why when refused */

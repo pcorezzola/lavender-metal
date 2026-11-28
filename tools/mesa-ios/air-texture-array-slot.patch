@@ -1,0 +1,137 @@
+--- a/air/air_to_nir.c
++++ b/air/air_to_nir.c
+@@ -365,6 +365,84 @@
+       t = et;
+    }
+    return NULL;
++}
++
++static struct air_val **
++slot_cell_ptr(struct air_ctx *c, unsigned s, uint64_t off)
++{
++   struct air_val **cell = &c->slots[s].val;
++   const struct air_type *t = c->slots[s].type;
++   for (unsigned depth = 0; depth < 32; depth++) {
++      if (t && t->kind == AIR_TYPE_POINTER && off == 0)
++         return cell;
++      if (!t)
++         return NULL;
++      unsigned index, count;
++      const struct air_type *et;
++      if (t->kind == AIR_TYPE_STRUCT) {
++         count = t->num_members;
++         index = count;
++         uint64_t base = 0;
++         for (unsigned i = 0; i < count; i++) {
++            uint64_t mo = air_struct_member_offset(c->m, t, i);
++            uint64_t ms = air_type_alloc_size(c->m, t->members[i]);
++            if (off >= mo && off < mo + ms) {
++               index = i;
++               base = mo;
++               break;
++            }
++         }
++         if (index == count)
++            return NULL;
++         et = t->members[index];
++         off -= base;
++      } else if (t->kind == AIR_TYPE_ARRAY) {
++         uint64_t es = air_type_alloc_size(c->m, t->elem);
++         if (!es || off / es >= t->count)
++            return NULL;
++         count = t->count > UINT_MAX ? UINT_MAX : (unsigned)t->count;
++         index = (unsigned)(off / es);
++         et = t->elem;
++         off -= (uint64_t)index * es;
++      } else {
++         return NULL;
++      }
++      if (!*cell)
++         *cell = air_val_agg(c, count);
++      if (!*cell || (*cell)->kind != AIR_VAL_AGG || index >= (*cell)->num_elems)
++         return NULL;
++      cell = &(*cell)->elems[index];
++      t = et;
++   }
++   return NULL;
++}
++
++bool air_memcpy_resource_to_slot(struct air_ctx *c, struct air_val *dst, struct air_val *src, uint64_t bytes);
++
++bool
++air_memcpy_resource_to_slot(struct air_ctx *c, struct air_val *dst,
++                            struct air_val *src, uint64_t bytes)
++{
++   unsigned sslot = 0;
++   uint64_t soff = 0;
++   if (!slot_at_const(c, dst, &sslot, &soff))
++      return air_error(c, "intrinsic: memcpy into non-const slot");
++   if (c->slots[sslot].init)
++      return air_error(c, "intrinsic: memcpy into read-only global");
++   if (bytes % 8)
++      return air_error(c, "intrinsic: memcpy of resource array with %u bytes", (unsigned)bytes);
++   uint64_t n = bytes / 8;
++   for (uint64_t k = 0; k < n; k++) {
++      struct air_val **cell = slot_cell_ptr(c, sslot, soff + k * 8);
++      if (!cell)
++         return air_error(c, "intrinsic: memcpy resource into slot at byte %u failed",
++                          (unsigned)(soff + k * 8));
++      struct air_ptr p = src->ptr;
++      p.binding += (unsigned)k;
++      p.offset = NULL;
++      *cell = air_val_ptr(c, p);
++   }
++   return true;
+ }
+ 
+ 
+@@ -2225,8 +2303,14 @@
+       return translate_argument_buffer(c, node, param);
+ 
+    if (md_key(node, "air.texture") >= 0) {
+-      uint64_t index = 0;
+-      md_key_int(node, "air.location_index", &index);
++      uint64_t index = 0, count = 1;
++      int loc_k = md_key(node, "air.location_index");
++      if (loc_k >= 0) {
++         md_int(node, loc_k + 1, &index);
++         uint64_t cnt = 1;
++         if (md_int(node, loc_k + 2, &cnt) && cnt > 1)
++            count = cnt;
++      }
+       bool sample = md_key(node, "air.sample") >= 0;
+       bool read = md_key(node, "air.read") >= 0;
+       bool write = md_key(node, "air.write") >= 0 || md_key(node, "air.read_write") >= 0;
+@@ -2238,8 +2322,10 @@
+          .binding = index,
+          .is_image = write,
+       };
+-      add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index, 0,
+-                   sample || read, write, param, node);
++      for (uint64_t k = 0; k < count; k++) {
++         add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index + k, 0,
++                      sample || read, write, param, node);
++      }
+       c->params[param] = air_val_ptr(c, p);
+       return true;
+    }
+--- a/air/air_intrinsics.c
++++ b/air/air_intrinsics.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include "air_private.h"
++bool air_memcpy_resource_to_slot(struct air_ctx *c, struct air_val *dst, struct air_val *src, uint64_t bytes);
+ 
+ #include <string.h>
+ 
+@@ -1653,6 +1654,9 @@
+       uint64_t bytes;
+       if (!air_const_uint(in->operands[3], &bytes))
+          return air_error(c, "intrinsic: memcpy of a run-time length");
++      if (dst->ptr.class == AIR_PTR_SLOT &&
++          (src->ptr.class == AIR_PTR_TEXTURE || src->ptr.class == AIR_PTR_SAMPLER))
++         return air_memcpy_resource_to_slot(c, dst, src, bytes);
+       /* in 4-byte pieces, which is what every memcpy in the corpus is a
+        * multiple of (they copy float vectors out of constant buffers)
+        */

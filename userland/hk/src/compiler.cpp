@@ -1446,7 +1446,7 @@ constexpr uint32_t kCacheMagic = 0x53434d48;   // "HMCS"
 #ifdef HAKIOS_METAL_CACHE_BUILD
 const char* const kCacheBuild = HAKIOS_METAL_CACHE_BUILD;
 #else
-const char* const kCacheBuild = __DATE__ " " __TIME__;
+const char* const kCacheBuild = "lavcache-v1";
 #endif
 
 // The file name of a stage in the cache (no directory), "" when no cache is configured: the writable directory

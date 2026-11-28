@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 . ../tools/mesa-ios/flags.sh
 mkdir -p out/LavenderMetal.bundle
-CC="xcrun -sdk iphoneos clang -arch arm64 -target arm64-apple-ios16.0 -O1 -Wall"
+CC="xcrun -sdk iphoneos clang -arch arm64 -target arm64-apple-ios16.0 -O2 -Wall"
 
 (cd hk && ./build-ios.sh)
 $CC -std=gnu11 -c lava5.c -o out/lava5.o
@@ -26,7 +26,7 @@ $CC -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore -fra
 codesign -s - -f out/lavmetal_test
 $CC -fobjc-arc -framework Foundation -framework Metal -framework IOKit -o out/lavqc_test lavqc_test.m
 codesign -s - -f out/lavqc_test
-$CC -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -framework IOKit -o out/lavca_test lavca_test.m
+$CC -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -framework IOKit -framework IOSurface -o out/lavca_test lavca_test.m
 $CC -framework IOKit -o out/lavmetal_switch lavmetal_switch.c
 codesign -s - -f out/lavmetal_switch
 codesign -s - -f out/lavca_test

@@ -537,15 +537,16 @@ lav5_build_render(uint32_t * words, size_t cap, const struct lav5_render * r, co
 	set(s, REG_A5XX_RB_DEPTH_PLANE_CNTL, 0);
 	set(s, REG_A5XX_GRAS_SU_DEPTH_PLANE_CNTL, 0);
 
-	/* scissor (Metal's, top-left origin: the same numbers) */
+	/* scissor (Metal's, top-left origin: the same numbers); first band if band_step > 0 */
+	uint32_t first_h = (r->band_step != 0 && r->scissor[3] > r->band_step) ? r->band_step : r->scissor[3];
 	pkt4(s, REG_A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0, 2);
 	out(s, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(r->scissor[0]) | A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(r->scissor[1]));
 	out(s, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(r->scissor[0] + r->scissor[2] - 1) |
-	    A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(r->scissor[1] + r->scissor[3] - 1));
+	    A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(r->scissor[1] + first_h - 1));
 	pkt4(s, REG_A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0, 2);
 	out(s, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(r->scissor[0]) | A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(r->scissor[1]));
 	out(s, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(r->scissor[0] + r->scissor[2] - 1) |
-	    A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(r->scissor[1] + r->scissor[3] - 1));
+	    A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(r->scissor[1] + first_h - 1));
 
 	/* viewport: NDC y up to a window y down (Metal's), z in [0, 1] */
 	(void)vp_x; (void)vp_y;
@@ -942,25 +943,43 @@ lav5_build_render(uint32_t * words, size_t cap, const struct lav5_render * r, co
 	set(s, REG_A5XX_RB_RENDER_CNTL, 0x8);
 	set(s, REG_A5XX_GRAS_SC_CNTL, 0x8);
 
-	/* the draw */
-	if (r->index_gpu != 0) {
-		/* fd5_draw.c: instances, count, first index 0, the index buffer's address and the indices it holds */
-		pkt7(s, CP_DRAW_INDX_OFFSET, 7);
-		out(s, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(r->prim) | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_DMA) |
-		    CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(r->index_size == 1 ? INDEX4_SIZE_16_BIT : INDEX4_SIZE_32_BIT) |
-		    CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY));
-		out(s, r->instances);
-		out(s, r->count);
-		out(s, 0);
-		out(s, (uint32_t)r->index_gpu);
-		out(s, (uint32_t)(r->index_gpu >> 32));
-		out(s, r->index_max);
-	} else {
-		pkt7(s, CP_DRAW_INDX_OFFSET, 3);
-		out(s, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(r->prim) | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
-		    CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT) | CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY));
-		out(s, r->instances);
-		out(s, r->count);
+	/* the draw (and any remaining scissor bands in the same stream) */
+	uint32_t band_step = (r->band_step != 0 && r->scissor[3] > r->band_step) ? r->band_step : r->scissor[3];
+	for (uint32_t off = 0; off < r->scissor[3]; off += band_step) {
+		if (off > 0) {
+			uint32_t by = r->scissor[1] + off;
+			uint32_t bh = r->scissor[3] - off < band_step ? r->scissor[3] - off : band_step;
+
+			wfi(s);
+			pkt4(s, REG_A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0, 2);
+			out(s, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(r->scissor[0]) | A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(by));
+			out(s, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(r->scissor[0] + r->scissor[2] - 1) |
+			    A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(by + bh - 1));
+			pkt4(s, REG_A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0, 2);
+			out(s, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(r->scissor[0]) | A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(by));
+			out(s, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(r->scissor[0] + r->scissor[2] - 1) |
+			    A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(by + bh - 1));
+			wfi(s);
+		}
+		if (r->index_gpu != 0) {
+			/* fd5_draw.c: instances, count, first index 0, the index buffer's address and the indices it holds */
+			pkt7(s, CP_DRAW_INDX_OFFSET, 7);
+			out(s, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(r->prim) | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_DMA) |
+			    CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(r->index_size == 1 ? INDEX4_SIZE_16_BIT : INDEX4_SIZE_32_BIT) |
+			    CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY));
+			out(s, r->instances);
+			out(s, r->count);
+			out(s, 0);
+			out(s, (uint32_t)r->index_gpu);
+			out(s, (uint32_t)(r->index_gpu >> 32));
+			out(s, r->index_max);
+		} else {
+			pkt7(s, CP_DRAW_INDX_OFFSET, 3);
+			out(s, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(r->prim) | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
+			    CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT) | CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY));
+			out(s, r->instances);
+			out(s, r->count);
+		}
 	}
 
 	/* fd5_emit_sysmem_fini, then the flush with a timestamp so that memory holds the pixels */
